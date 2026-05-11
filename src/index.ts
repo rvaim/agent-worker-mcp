@@ -822,7 +822,17 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     policy,
     allowed_files: options.allowed_files ?? existing?.allowed_files ?? null,
     forbidden_files: options.forbidden_files ?? existing?.forbidden_files ?? null,
-    acpx,
+    acpx: {
+      command: acpx.command,
+      args: acpx.args,
+      cwd: acpx.cwd,
+      exit_code: acpx.exit_code,
+      signal: acpx.signal,
+      timed_out: acpx.timed_out,
+      duration_ms: acpx.duration_ms,
+      stdout_path: acpx.stdout_path,
+      stderr_path: acpx.stderr_path,
+    },
     test: test ?? null,
     git: git
       ? {
