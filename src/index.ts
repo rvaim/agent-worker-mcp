@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
@@ -58,6 +58,7 @@ type WorkerRunOptions = {
   prompt_file: string;
   run_cwd: string;
   session?: string;
+  model?: string;
   mode: RunMode;
   approval: ApprovalMode;
   json_strict: boolean;
@@ -504,11 +505,56 @@ function taskMarkdown(params: {
 }) {
   const allowed = params.allowed_files?.length
     ? params.allowed_files.map((f) => `- ${f}`).join("\n")
-    : "- Not specified";
+    : "- Not specified (all files allowed)";
   const forbidden = params.forbidden_files?.length
     ? params.forbidden_files.map((f) => `- ${f}`).join("\n")
-    : "- Not specified";
-  return `# Task: ${params.task_id}\n\n## Worker Agent\n\n${params.worker_agent}\n\n## Instructions\n\n${params.instructions}\n\n## Allowed Files\n\n${allowed}\n\n## Forbidden Files\n\n${forbidden}\n\n## Acceptance Criteria\n\n- Complete the requested implementation.\n- Keep changes minimal and focused.\n- Do not modify forbidden files.\n- Run or support the requested tests when applicable.\n- Return a concise summary of changes, tests run, and remaining risks.\n`;
+    : "- None";
+  return `# Task: ${params.task_id}
+
+## Worker Agent
+
+${params.worker_agent}
+
+## Instructions
+
+${params.instructions}
+
+## Allowed Files
+
+${allowed}
+
+## Forbidden Files
+
+${forbidden}
+
+## Requirements
+
+1. Complete the requested implementation.
+2. Keep changes minimal and focused — no unrelated refactors.
+3. Do not modify forbidden files under any circumstance.
+4. Run relevant tests when applicable.
+
+## Output Format
+
+Reply with a structured summary using exactly this format:
+
+\`\`\`
+## Summary
+[One sentence describing what was done]
+
+## Changed Files
+- path/to/file1 — [what and why]
+- path/to/file2 — [what and why]
+(If none: "No files modified")
+
+## Tests Run
+- [test command] — [result]
+(If none: "No tests applicable")
+
+## Remaining Risks
+[One sentence. If none: "None"]
+\`\`\`
+`;
 }
 
 async function loadExistingResult(root: string, task_id: string): Promise<any | null> {
@@ -675,6 +721,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     ];
 
     if (options.json_strict) args.push("--json-strict");
+    if (options.model) args.push("--model", options.model);
     args.push(approvalFlag(options.approval));
     args.push(options.worker_agent);
     if (options.session) args.push("-s", options.session);
@@ -702,6 +749,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       run_cwd,
       worktree_path: options.worktree_path ?? null,
       session: options.session ?? existing?.session ?? null,
+      model: options.model ?? existing?.model ?? null,
       mode: options.mode,
       approval: options.approval,
       task_path: existing?.task_path ?? path.relative(root, path.join(root, ".agent", "tasks", `${options.task_id}.md`)),
@@ -813,6 +861,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     run_cwd,
     worktree_path: options.worktree_path ?? existing?.worktree_path ?? null,
     session: options.session ?? existing?.session ?? null,
+    model: options.model ?? existing?.model ?? null,
     mode: options.mode,
     approval: options.approval,
     task_path: existing?.task_path ?? path.relative(root, path.join(root, ".agent", "tasks", `${options.task_id}.md`)),
@@ -902,6 +951,7 @@ server.tool(
     isolate_worktree: z.boolean().default(false),
     force_recreate_worktree: z.boolean().default(false).describe("If true and worktree exists, remove and recreate it."),
     session: z.string().optional().describe("Optional acpx named session, passed as -s <session>."),
+    model: z.string().optional().describe("Model id for the worker agent (e.g. 'sonnet[1m]', 'opus[1m]'). Passed as --model to acpx."),
     mode: RunModeSchema,
     approval: ApprovalSchema,
     json_strict: z.boolean().default(true),
@@ -929,6 +979,9 @@ server.tool(
         ? await resolveInside(root, input.worker_cwd)
         : root;
 
+    // Load previous result to warn on overwrite and preserve history
+    const existingResult = await loadExistingResult(root, input.task_id);
+
     const taskFile = path.join(taskDir, `${input.task_id}.md`);
     await writeFile(
       taskFile,
@@ -948,6 +1001,7 @@ server.tool(
       prompt_file: path.relative(root, taskFile),
       run_cwd,
       session: input.session,
+      model: input.model,
       mode: input.mode,
       approval: input.approval,
       json_strict: input.json_strict,
@@ -960,7 +1014,7 @@ server.tool(
       forbidden_files: input.forbidden_files,
       revision_count: 0,
       worktree_path,
-      existing_result: null,
+      existing_result: existingResult,
     });
 
     return textResult(result);
@@ -979,6 +1033,7 @@ server.tool(
     forbidden_files: z.array(z.string()).optional().describe("Override forbidden files. Defaults to original task's forbidden_files."),
     worker_cwd: z.string().optional(),
     session: z.string().optional(),
+    model: z.string().optional().describe("Model id for the worker agent. Passed as --model to acpx."),
     mode: RunModeSchema,
     approval: ApprovalSchema,
     json_strict: z.boolean().default(true),
@@ -994,6 +1049,19 @@ server.tool(
 
     const root = await repoRootFrom(input.cwd);
     const existing = await loadExistingResult(root, input.task_id);
+
+    // Enforce max 3 revisions
+    const MAX_REVISIONS = 3;
+    const currentRevisions = existing?.revision_count ?? 0;
+    if (currentRevisions >= MAX_REVISIONS) {
+      return textResult({
+        task_id: input.task_id,
+        error: `Revision limit reached (${MAX_REVISIONS} max, ${currentRevisions} already done). Review the current result and accept or reject.`,
+        revision_count: currentRevisions,
+        max_revisions: MAX_REVISIONS,
+      });
+    }
+
     const agentDir = path.join(root, ".agent");
     const taskFile = path.join(agentDir, "tasks", `${input.task_id}.md`);
     if (!(await exists(taskFile))) throw new Error(`Missing original task file: ${taskFile}`);
@@ -1032,6 +1100,7 @@ server.tool(
       prompt_file: path.relative(root, revisionPromptFile),
       run_cwd,
       session: input.session ?? existing?.session ?? undefined,
+      model: input.model ?? existing?.model ?? undefined,
       mode: input.mode,
       approval: input.approval,
       json_strict: input.json_strict,
@@ -1244,7 +1313,6 @@ server.tool(
 
     const removed: string[] = [];
     // Remove result artifacts (all files matching task_id prefix)
-    const { readdir, rm } = await import("node:fs/promises");
     try {
       const files = await readdir(resultDir);
       for (const f of files) {
