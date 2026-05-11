@@ -22,3 +22,16 @@ Workflow:
 5. If blocking issues exist, call `revise_worker` with precise feedback.
 6. Never accept based only on the worker's natural-language summary.
 7. Limit revision loops to 3 attempts unless the user explicitly asks otherwise.
+
+## Review Checklist
+
+Never accept a worker result based only on the worker's summary. Always inspect:
+
+- result JSON (`read_worker_result`)
+- changed files list
+- git diff content
+- test log (if applicable)
+- policy violations (`forbidden_file_modified`, `outside_allowed_files`)
+- `truncated` flags in the response — if any field is truncated, request a narrower read or inspect the file directly
+
+If the worker modified forbidden files, request revision or reject the result. If the worker changed files outside the allowed set, flag as a policy violation.

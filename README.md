@@ -191,3 +191,22 @@ exec
 ```
 
 If your `acpx` version changes those flags, update the internal invocation in `src/index.ts` while keeping the MCP tool schemas stable.
+
+## Known Limitations
+
+- `acpx` CLI arguments must be verified against the installed `acpx` version. `acpx` is not publicly available on npm; it must be installed from its source.
+- `cancel_worker` is best-effort. It sends a cancel request to `acpx` but may not stop an already-running process.
+- `no_wait` / background execution is currently disabled. Calling with `no_wait=true` returns an error.
+- `test_command` as a string is executed through the shell and should only be used with trusted input. Prefer the structured `{cmd, args}` form.
+- Worktree isolation is optional. Worktrees may require manual cleanup via `git worktree remove`.
+- Reviewer agents must inspect git diff and test logs; worker summaries alone are not sufficient for accepting results.
+- `acpx` spawn failures and non-zero exit codes write structured error results to `.agent/results/<task_id>.result.json`.
+
+## Running Tests
+
+```bash
+npm install
+npm test
+```
+
+Tests use [vitest](https://vitest.dev) and mock `acpx` invocations. No real worker agent is required.
