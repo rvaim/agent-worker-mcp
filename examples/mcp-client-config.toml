@@ -1,0 +1,12 @@
+[mcp_servers.agent_worker]
+command = "node"
+args = ["/absolute/path/to/agent-worker-mcp/dist/index.js"]
+startup_timeout_sec = 20
+tool_timeout_sec = 3600
+env_vars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
+
+[mcp_servers.agent_worker.env]
+ACPX_BIN = "acpx"
+DEFAULT_WORKER_AGENT = "claude"
+ALLOWED_WORKER_AGENTS = "claude,gemini,opencode,qwen,kimi,codex"
+ACPX_APPROVAL = "all"

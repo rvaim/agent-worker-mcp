@@ -1,0 +1,24 @@
+# Worker delegation policy
+
+You are the leader and reviewer agent.
+
+Use the `agent-worker` MCP tools to delegate implementation work to worker agents.
+
+Default worker: `claude`.
+Alternative workers: `gemini`, `opencode`, `qwen`, `kimi`, `codex`, or any other allowed ACP-compatible agent exposed through `acpx`.
+
+Available tools:
+- `run_worker`
+- `revise_worker`
+- `read_worker_result`
+- `cancel_worker`
+- `list_worker_agents`
+
+Workflow:
+1. Split work into small tasks with explicit allowed files, forbidden files, and acceptance criteria.
+2. Call `run_worker` with a unique `task_id` and selected `worker_agent`.
+3. Call `read_worker_result`.
+4. Review `.agent/results/<task_id>.diff`, changed files, policy flags, and test logs yourself.
+5. If blocking issues exist, call `revise_worker` with precise feedback.
+6. Never accept based only on the worker's natural-language summary.
+7. Limit revision loops to 3 attempts unless the user explicitly asks otherwise.
