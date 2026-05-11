@@ -546,6 +546,7 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
   const messageChunks: string[] = [];
   let firstTimestamp: number | null = null;
   let lastTimestamp: number | null = null;
+  const seenToolCalls = new Set<string>();
 
   for (const line of lines) {
     try {
@@ -559,10 +560,22 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
         if (su === "agent_message_chunk" && update.content?.type === "text") {
           messageChunks.push(update.content.text ?? "");
         }
+
+        // Tool calls: Claude uses name/tool, Codex uses title
         if (su === "tool_call" || su === "tool_use") {
-          summary.tool_calls.push(update.name ?? update.tool ?? "unknown");
+          const toolName = update.title ?? update.name ?? update.tool ?? "unknown";
+          if (!seenToolCalls.has(toolName)) {
+            summary.tool_calls.push(toolName);
+            seenToolCalls.add(toolName);
+          }
         }
+
+        // Usage: Claude has cost in last usage_update, Codex has used (total tokens)
         if (su === "usage_update") {
+          if (update.used != null && summary.input_tokens === null) {
+            // Codex: only has total token count, store as input_tokens
+            summary.input_tokens = update.used;
+          }
           if (update.cost) {
             summary.cost_usd = update.cost.amount ?? null;
           }
@@ -577,17 +590,21 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
         }
       }
       if (event.type === "tool_call" || event.type === "tool_use") {
-        summary.tool_calls.push(event.name ?? event.tool ?? "unknown");
+        const toolName = event.title ?? event.name ?? event.tool ?? "unknown";
+        if (!seenToolCalls.has(toolName)) {
+          summary.tool_calls.push(toolName);
+          seenToolCalls.add(toolName);
+        }
       }
       if (event.type === "error") {
         summary.error_event = event.message ?? event.error ?? JSON.stringify(event);
       }
 
-      // acpx JSON-RPC format: final response with stopReason + usage
+      // acpx JSON-RPC format: final response with stopReason + usage (Claude)
       if (event.id != null && event.result?.stopReason) {
         summary.stop_reason = event.result.stopReason;
         if (event.result.usage) {
-          summary.input_tokens = event.result.usage.inputTokens ?? null;
+          summary.input_tokens = event.result.usage.inputTokens ?? summary.input_tokens;
           summary.output_tokens = event.result.usage.outputTokens ?? null;
         }
       }
@@ -846,7 +863,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     worker_stop_reason: eventsSummary?.stop_reason ?? existing?.worker_stop_reason ?? null,
     worker_tool_calls: eventsSummary?.tool_calls ?? existing?.worker_tool_calls ?? [],
     worker_error_event: eventsSummary?.error_event ?? existing?.worker_error_event ?? null,
-    worker_duration_ms: eventsSummary?.duration_ms ?? existing?.worker_duration_ms ?? null,
+    worker_duration_ms: eventsSummary?.duration_ms ?? acpx.duration_ms ?? existing?.worker_duration_ms ?? null,
     worker_input_tokens: eventsSummary?.input_tokens ?? existing?.worker_input_tokens ?? null,
     worker_output_tokens: eventsSummary?.output_tokens ?? existing?.worker_output_tokens ?? null,
     worker_cost_usd: eventsSummary?.cost_usd ?? existing?.worker_cost_usd ?? null,
@@ -1053,19 +1070,24 @@ server.tool(
     const resultText = await readTextIfExists(resultPath, maxChars);
     const parsed = resultText ? JSON.parse(resultText) : null;
 
-    const paths = {
-      result_path: path.relative(root, resultPath),
-      run_events_path: path.relative(root, path.join(resultDir, `${input.task_id}.run.events.ndjson`)),
-      run_stderr_path: path.relative(root, path.join(resultDir, `${input.task_id}.run.stderr.log`)),
-      revision_events_path: path.relative(root, path.join(resultDir, `${input.task_id}.revision.events.ndjson`)),
-      revision_stderr_path: path.relative(root, path.join(resultDir, `${input.task_id}.revision.stderr.log`)),
-      diff_path: path.relative(root, path.join(resultDir, `${input.task_id}.diff`)),
-      status_path: path.relative(root, path.join(resultDir, `${input.task_id}.status.txt`)),
-      run_test_log_path: path.relative(root, path.join(resultDir, `${input.task_id}.run.test.log`)),
-      revision_test_log_path: path.relative(root, path.join(resultDir, `${input.task_id}.revision.test.log`)),
-    };
+    if (!parsed) {
+      return textResult({
+        task_id: input.task_id,
+        error: `No result found for task '${input.task_id}'. Run 'run_worker' first.`,
+        result: null,
+        artifacts: {},
+        diff: null,
+        status: null,
+        truncated: { result: false, diff: false, status: false, run_events: false, run_stderr: false, revision_events: false, revision_stderr: false, run_test_log: false, revision_test_log: false },
+      });
+    }
 
+    // Use paths from result JSON (which are accurate for both run and revision)
     const abs = (rel: string) => path.join(root, rel);
+    const resolvePath = (key: string, fallback: string) => {
+      const p = parsed[key];
+      return p ? abs(p) : abs(fallback);
+    };
 
     function truncRead(text: string | null, limit: number): { value: string | null; truncated: boolean } {
       if (!text) return { value: null, truncated: false };
@@ -1078,14 +1100,17 @@ server.tool(
       };
     }
 
-    const diffRaw = input.include_diff ? await readTextIfExists(abs(paths.diff_path), 2_000_000) : null;
-    const runEventsRaw = input.include_events ? await readTextIfExists(abs(paths.run_events_path), 2_000_000) : null;
-    const revEventsRaw = input.include_events ? await readTextIfExists(abs(paths.revision_events_path), 2_000_000) : null;
-    const runTestRaw = input.include_test_log ? await readTextIfExists(abs(paths.run_test_log_path), 2_000_000) : null;
-    const revTestRaw = input.include_test_log ? await readTextIfExists(abs(paths.revision_test_log_path), 2_000_000) : null;
-    const statusRaw = await readTextIfExists(abs(paths.status_path), 50_000);
-    const runStderrRaw = await readTextIfExists(abs(paths.run_stderr_path), 50_000);
-    const revStderrRaw = await readTextIfExists(abs(paths.revision_stderr_path), 50_000);
+    const diffRaw = input.include_diff ? await readTextIfExists(resolvePath("diff_path", path.join(resultDir, `${input.task_id}.diff`)), 2_000_000) : null;
+    const runEventsRaw = input.include_events ? await readTextIfExists(resolvePath("events_path", path.join(resultDir, `${input.task_id}.run.events.ndjson`)), 2_000_000) : null;
+    const revEventsLatest = parsed.revision_events_paths?.slice(-1)[0];
+    const revEventsRaw = input.include_events && revEventsLatest ? await readTextIfExists(abs(revEventsLatest), 2_000_000) : null;
+    const runTestRaw = input.include_test_log ? await readTextIfExists(resolvePath("test_log_path", path.join(resultDir, `${input.task_id}.run.test.log`)), 2_000_000) : null;
+    const revTestLatest = parsed.revision_test_log_paths?.slice(-1)[0] ?? parsed.latest_test_log_path;
+    const revTestRaw = input.include_test_log && revTestLatest ? await readTextIfExists(abs(revTestLatest), 2_000_000) : null;
+    const statusRaw = await readTextIfExists(resolvePath("status_path", path.join(resultDir, `${input.task_id}.status.txt`)), 50_000);
+    const runStderrRaw = await readTextIfExists(resolvePath("stderr_paths[0]", path.join(resultDir, `${input.task_id}.run.stderr.log`)), 50_000);
+    const revStderrLatest = parsed.revision_stderr_paths?.slice(-1)[0];
+    const revStderrRaw = revStderrLatest ? await readTextIfExists(abs(revStderrLatest), 50_000) : null;
 
     const diffResult = truncRead(diffRaw, maxChars);
     const runEventsResult = truncRead(runEventsRaw, maxChars);
@@ -1100,7 +1125,15 @@ server.tool(
     const out = {
       task_id: input.task_id,
       result: resultTextResult.value ? JSON.parse(resultTextResult.value) : null,
-      artifacts: paths,
+      artifacts: {
+        result_path: path.relative(root, resultPath),
+        events_path: parsed.events_path ?? null,
+        revision_events_paths: parsed.revision_events_paths ?? [],
+        diff_path: parsed.diff_path ?? null,
+        status_path: parsed.status_path ?? null,
+        test_log_path: parsed.test_log_path ?? null,
+        latest_test_log_path: parsed.latest_test_log_path ?? null,
+      },
       diff: diffResult.value,
       status: statusResult.value,
       run_events: runEventsResult.value,
@@ -1189,6 +1222,77 @@ server.tool(
     }
 
     return textResult(cancelResult);
+  },
+);
+
+server.tool(
+  "cleanup_worker",
+  "Delete saved artifacts for a task, including result JSON, events, stderr, diff, status, and worktree if present.",
+  {
+    task_id: TaskIdSchema,
+    cwd: z.string().optional(),
+    remove_worktree: z.boolean().default(false).describe("Also remove the git worktree and branch for this task."),
+  },
+  async (input) => {
+    const root = await repoRootFrom(input.cwd);
+    const resultDir = path.join(root, ".agent", "results");
+    const existing = await loadExistingResult(root, input.task_id);
+
+    if (!existing) {
+      return textResult({ task_id: input.task_id, status: "nothing_to_cleanup", message: "No result found for this task_id." });
+    }
+
+    const removed: string[] = [];
+    // Remove result artifacts (all files matching task_id prefix)
+    const { readdir, rm } = await import("node:fs/promises");
+    try {
+      const files = await readdir(resultDir);
+      for (const f of files) {
+        if (f.startsWith(input.task_id)) {
+          await rm(path.join(resultDir, f), { force: true });
+          removed.push(f);
+        }
+      }
+    } catch {
+      // dir may not exist
+    }
+
+    // Remove task file
+    const taskFile = path.join(root, ".agent", "tasks", `${input.task_id}.md`);
+    if (await exists(taskFile)) {
+      await rm(taskFile, { force: true });
+      removed.push(path.relative(root, taskFile));
+    }
+
+    // Remove review file
+    const reviewFile = path.join(root, ".agent", "reviews", `${input.task_id}.md`);
+    if (await exists(reviewFile)) {
+      await rm(reviewFile, { force: true });
+      removed.push(path.relative(root, reviewFile));
+    }
+
+    // Remove worktree if requested
+    let worktree_removed = false;
+    if (input.remove_worktree && existing.worktree_path) {
+      const wtPath = path.resolve(root, existing.worktree_path);
+      if (await exists(wtPath)) {
+        await runCommand({
+          command: "git",
+          args: ["-C", root, "worktree", "remove", "--force", wtPath],
+          cwd: root,
+          timeout_ms: 30_000,
+        });
+        worktree_removed = true;
+      }
+    }
+
+    return textResult({
+      task_id: input.task_id,
+      status: "cleaned_up",
+      removed_files: removed,
+      removed_count: removed.length,
+      worktree_removed,
+    });
   },
 );
 

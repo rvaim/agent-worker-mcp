@@ -31,12 +31,12 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
   const messageChunks: string[] = [];
   let firstTimestamp: number | null = null;
   let lastTimestamp: number | null = null;
+  const seenToolCalls = new Set<string>();
 
   for (const line of lines) {
     try {
       const event = JSON.parse(line);
 
-      // acpx JSON-RPC format
       if (event.method === "session/update" && event.params?.update) {
         const update = event.params.update;
         const su = update.sessionUpdate;
@@ -44,15 +44,25 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
         if (su === "agent_message_chunk" && update.content?.type === "text") {
           messageChunks.push(update.content.text ?? "");
         }
+
         if (su === "tool_call" || su === "tool_use") {
-          summary.tool_calls.push(update.name ?? update.tool ?? "unknown");
+          const toolName = update.title ?? update.name ?? update.tool ?? "unknown";
+          if (!seenToolCalls.has(toolName)) {
+            summary.tool_calls.push(toolName);
+            seenToolCalls.add(toolName);
+          }
         }
-        if (su === "usage_update" && update.cost) {
-          summary.cost_usd = update.cost.amount ?? null;
+
+        if (su === "usage_update") {
+          if (update.used != null && summary.input_tokens === null) {
+            summary.input_tokens = update.used;
+          }
+          if (update.cost) {
+            summary.cost_usd = update.cost.amount ?? null;
+          }
         }
       }
 
-      // Generic event format
       if (event.type === "result" || event.type === "done") {
         summary.stop_reason = event.stop_reason ?? event.subtype ?? event.stopReason ?? null;
         if (event.final_message || event.message || event.text) {
@@ -60,17 +70,20 @@ function parseWorkerEvents(eventsText: string | null): WorkerEventSummary {
         }
       }
       if (event.type === "tool_call" || event.type === "tool_use") {
-        summary.tool_calls.push(event.name ?? event.tool ?? "unknown");
+        const toolName = event.title ?? event.name ?? event.tool ?? "unknown";
+        if (!seenToolCalls.has(toolName)) {
+          summary.tool_calls.push(toolName);
+          seenToolCalls.add(toolName);
+        }
       }
       if (event.type === "error") {
         summary.error_event = event.message ?? event.error ?? JSON.stringify(event);
       }
 
-      // acpx JSON-RPC final result
       if (event.id != null && event.result?.stopReason) {
         summary.stop_reason = event.result.stopReason;
         if (event.result.usage) {
-          summary.input_tokens = event.result.usage.inputTokens ?? null;
+          summary.input_tokens = event.result.usage.inputTokens ?? summary.input_tokens;
           summary.output_tokens = event.result.usage.outputTokens ?? null;
         }
       }
@@ -173,7 +186,7 @@ describe("parseWorkerEvents", () => {
     expect(s.final_message).toBe("Hit limit");
   });
 
-  it("parses acpx JSON-RPC session/update format", () => {
+  it("parses acpx JSON-RPC session/update format (Claude)", () => {
     const events = [
       JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "abc", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } } } }),
       JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "abc", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "!" } } } }),
@@ -187,6 +200,32 @@ describe("parseWorkerEvents", () => {
     expect(s.input_tokens).toBe(100);
     expect(s.output_tokens).toBe(50);
     expect(s.cost_usd).toBe(0.065);
+  });
+
+  it("parses Codex tool_call with title field", () => {
+    const events = [
+      JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "abc", update: { sessionUpdate: "tool_call", title: "pwd", kind: "execute", status: "in_progress" } } }),
+      JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "abc", update: { sessionUpdate: "tool_call_update", toolCallId: "x", status: "completed" } } }),
+      JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "abc", update: { sessionUpdate: "usage_update", used: 20308, size: 258400 } } }),
+      JSON.stringify({ jsonrpc: "2.0", id: 2, result: { stopReason: "end_turn" } }),
+    ].join("\n");
+
+    const s = parseWorkerEvents(events);
+    expect(s.tool_calls).toEqual(["pwd"]);
+    expect(s.stop_reason).toBe("end_turn");
+    expect(s.input_tokens).toBe(20308);
+    expect(s.output_tokens).toBeNull(); // Codex doesn't report output tokens
+  });
+
+  it("deduplicates tool calls", () => {
+    const events = [
+      JSON.stringify({ type: "tool_call", name: "bash" }),
+      JSON.stringify({ type: "tool_call", name: "bash" }),
+      JSON.stringify({ type: "done", stop_reason: "end_turn" }),
+    ].join("\n");
+
+    const s = parseWorkerEvents(events);
+    expect(s.tool_calls).toEqual(["bash"]);
   });
 });
 
