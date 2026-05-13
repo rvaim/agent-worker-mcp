@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
@@ -51,6 +51,15 @@ type StructuredTestCommand = {
   args: string[];
 };
 
+type InjectedContextFile = {
+  kind: "skill" | "context";
+  path: string;
+  content: string;
+  truncated: boolean;
+  original_bytes: number;
+  included_bytes: number;
+};
+
 type WorkerRunOptions = {
   cwd: string;
   worker_agent: string;
@@ -69,9 +78,41 @@ type WorkerRunOptions = {
   run_label: "run" | "revision";
   allowed_files?: string[];
   forbidden_files?: string[];
+  skill_paths?: string[];
+  context_files?: string[];
+  injected_context_files?: InjectedContextFile[];
   revision_count?: number;
   worktree_path?: string | null;
   existing_result?: any | null;
+};
+
+type RunningWorkerResultParams = {
+  task_id: string;
+  worker_agent: string;
+  root: string;
+  run_cwd: string;
+  prompt_file: string;
+  result_path: string;
+  events_path: string;
+  stderr_path: string;
+  run_label: "run" | "revision";
+  created_at: string;
+  mode: RunMode;
+  approval: ApprovalMode;
+  json_strict: boolean;
+  timeout_ms: number;
+  capture_diff: boolean;
+  session?: string | null;
+  model?: string | null;
+  test_command?: string | StructuredTestCommand | null;
+  allowed_files?: string[] | null;
+  forbidden_files?: string[] | null;
+  skill_paths?: string[] | null;
+  context_files?: string[] | null;
+  injected_context_files?: InjectedContextFile[];
+  worktree_path?: string | null;
+  existing_result?: any | null;
+  revision_count?: number;
 };
 
 const TaskIdSchema = z
@@ -110,11 +151,17 @@ function defaultMaxOutputBytes(): number {
   return Number.isFinite(bytes) && bytes > 0 ? bytes : 200_000;
 }
 
+function defaultMaxContextFileBytes(): number {
+  const bytes = Number.parseInt(process.env.WORKER_MAX_CONTEXT_FILE_BYTES ?? "80000", 10);
+  return Number.isFinite(bytes) && bytes > 0 ? bytes : 80_000;
+}
+
 const envApproval = ["all", "reads", "deny"].includes(process.env.ACPX_APPROVAL ?? "")
   ? (process.env.ACPX_APPROVAL as ApprovalMode)
   : "all";
 const ApprovalSchema = z.enum(["all", "reads", "deny"]).default(envApproval);
 const RunModeSchema = z.enum(["exec", "session"]).default("exec");
+const activeBackgroundJobs = new Map<string, { started_at: string; task_id: string; promise: Promise<unknown> }>();
 
 function textResult(value: unknown) {
   return {
@@ -324,6 +371,12 @@ function matchesGlob(file: string, pattern: string): boolean {
   return globToRegExp(normalizedPattern).test(normalizedFile);
 }
 
+export function artifactLabelForRun(run_label: "run" | "revision", revision_count = 0): string {
+  if (run_label === "run") return "run";
+  const safeRevision = Number.isFinite(revision_count) && revision_count > 0 ? revision_count : 1;
+  return `revision-${safeRevision}`;
+}
+
 function evaluatePolicy(params: {
   changed_files: string[];
   allowed_files?: string[];
@@ -496,12 +549,261 @@ async function readTextIfExists(file: string, maxChars = 30_000): Promise<string
   return text.slice(0, headChars) + `\n\n... [truncated ${text.length - maxChars} chars] ...\n\n` + text.slice(-tailChars);
 }
 
+function absArtifactPath(root: string, artifactPath: unknown): string | null {
+  if (typeof artifactPath !== "string" || !artifactPath) return null;
+  return path.isAbsolute(artifactPath) ? artifactPath : path.join(root, artifactPath);
+}
+
+function firstPath(value: unknown): string | null {
+  return Array.isArray(value) && typeof value[0] === "string" ? value[0] : null;
+}
+
+function lastPath(value: unknown): string | null {
+  return Array.isArray(value) && typeof value[value.length - 1] === "string" ? value[value.length - 1] : null;
+}
+
+export function selectWorkerResultArtifactPaths(parsed: any, root: string, task_id: string) {
+  const resultDir = path.join(root, ".agent", "results");
+  const fallback = (suffix: string) => path.join(resultDir, `${task_id}.${suffix}`);
+
+  return {
+    runEventsPath: absArtifactPath(root, parsed.events_path) ?? fallback("run.events.ndjson"),
+    latestRevisionEventsPath: absArtifactPath(root, lastPath(parsed.revision_events_paths)),
+    runStderrPath: absArtifactPath(root, firstPath(parsed.stderr_paths)) ?? fallback("run.stderr.log"),
+    latestRevisionStderrPath: absArtifactPath(root, lastPath(parsed.revision_stderr_paths)),
+    runTestLogPath:
+      absArtifactPath(root, firstPath(parsed.test_log_paths) ?? parsed.initial_test_log_path ?? parsed.test_log_path) ??
+      fallback("run.test.log"),
+    latestRevisionTestLogPath:
+      absArtifactPath(root, lastPath(parsed.revision_test_log_paths) ?? parsed.latest_test_log_path) ?? null,
+  };
+}
+
+export function summarizeAcpxHelp(helpText: string, expectedFlags: string[]): Record<string, boolean> {
+  return Object.fromEntries(expectedFlags.map((flag) => [flag, helpText.includes(flag)]));
+}
+
+export function resolveWorktreePathFromResult(parsed: any, root: string): string | null {
+  const worktreePath = parsed?.worktree_path;
+  if (typeof worktreePath !== "string" || !worktreePath) return null;
+  return path.isAbsolute(worktreePath) ? worktreePath : path.join(root, worktreePath);
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export function buildInjectedContextMarkdown(files: InjectedContextFile[]): string {
+  if (!files.length) return "";
+
+  const renderFile = (file: InjectedContextFile) => {
+    const tag = file.kind === "skill" ? "skill" : "context_file";
+    const attrs = [
+      `path="${escapeXmlAttribute(file.path)}"`,
+      `truncated="${file.truncated ? "true" : "false"}"`,
+      `original_bytes="${file.original_bytes}"`,
+      `included_bytes="${file.included_bytes}"`,
+    ].join(" ");
+    return `<${tag} ${attrs}>
+${file.content}
+</${tag}>`;
+  };
+
+  const skills = files.filter((file) => file.kind === "skill");
+  const contexts = files.filter((file) => file.kind === "context");
+  const sections: string[] = [];
+
+  if (skills.length) {
+    sections.push(`## Required Skills
+
+The worker must follow these injected skill instructions before working on the task.
+
+${skills.map(renderFile).join("\n\n")}`);
+  }
+
+  if (contexts.length) {
+    sections.push(`## Context Files
+
+The following files were provided as read-only context for this task.
+
+${contexts.map(renderFile).join("\n\n")}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+export function extractRecentLines(text: string | null | undefined, limit: number): string[] {
+  if (!text || limit <= 0) return [];
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(-limit);
+}
+
+export function buildRunningWorkerResult(params: RunningWorkerResultParams) {
+  const isRevision = params.run_label === "revision";
+  const existing = params.existing_result;
+  const taskPath = path.join(params.root, ".agent", "tasks", `${params.task_id}.md`);
+  const status = isRevision ? "revising" : "running";
+  const stderrRel = path.relative(params.root, params.stderr_path);
+  const priorStderr = existing?.stderr_paths ?? [];
+  const priorRevisionStderr = existing?.revision_stderr_paths ?? [];
+
+  return {
+    task_id: params.task_id,
+    worker_agent: params.worker_agent,
+    status,
+    created_at: existing?.created_at ?? params.created_at,
+    updated_at: params.created_at,
+    cwd: params.root,
+    run_cwd: params.run_cwd,
+    worktree_path: params.worktree_path ?? existing?.worktree_path ?? null,
+    session: params.session ?? existing?.session ?? null,
+    model: params.model ?? existing?.model ?? null,
+    mode: params.mode,
+    approval: params.approval,
+    json_strict: params.json_strict,
+    timeout_ms: params.timeout_ms,
+    capture_diff: params.capture_diff,
+    task_path: existing?.task_path ?? path.relative(params.root, taskPath),
+    prompt_file: path.relative(params.root, params.prompt_file),
+    result_path: path.relative(params.root, params.result_path),
+    events_path: existing?.events_path ?? (!isRevision ? path.relative(params.root, params.events_path) : null),
+    revision_events_paths: [
+      ...(existing?.revision_events_paths ?? []),
+      ...(isRevision ? [path.relative(params.root, params.events_path)] : []),
+    ],
+    stderr_paths: isRevision ? priorStderr : [...priorStderr, stderrRel],
+    revision_stderr_paths: isRevision ? [...priorRevisionStderr, stderrRel] : priorRevisionStderr,
+    test_log_paths: existing?.test_log_paths ?? [],
+    revision_test_log_paths: existing?.revision_test_log_paths ?? [],
+    latest_test_log_path: existing?.latest_test_log_path ?? null,
+    diff_path: existing?.diff_path ?? null,
+    cached_diff_path: existing?.cached_diff_path ?? null,
+    status_path: existing?.status_path ?? null,
+    untracked_path: existing?.untracked_path ?? null,
+    changed_files_path: existing?.changed_files_path ?? null,
+    test_log_path: existing?.test_log_path ?? null,
+    test_stderr_path: existing?.test_stderr_path ?? null,
+    changed_files: existing?.changed_files ?? [],
+    test_command: params.test_command ?? existing?.test_command ?? null,
+    test_exit_code: existing?.test_exit_code ?? null,
+    revision_count: params.revision_count ?? existing?.revision_count ?? 0,
+    policy: existing?.policy ?? { forbidden_file_modified: false, outside_allowed_files: false, violations: [] },
+    allowed_files: params.allowed_files ?? existing?.allowed_files ?? null,
+    forbidden_files: params.forbidden_files ?? existing?.forbidden_files ?? null,
+    skill_paths: params.skill_paths ?? existing?.skill_paths ?? null,
+    context_files: params.context_files ?? existing?.context_files ?? null,
+    injected_context_files: params.injected_context_files ?? existing?.injected_context_files ?? [],
+    acpx: null,
+    test: existing?.test ?? null,
+    git: existing?.git ?? null,
+    worker_summary: existing?.worker_summary ?? null,
+    worker_stop_reason: existing?.worker_stop_reason ?? null,
+    worker_tool_calls: existing?.worker_tool_calls ?? [],
+    worker_error_event: existing?.worker_error_event ?? null,
+    worker_duration_ms: null,
+    worker_input_tokens: existing?.worker_input_tokens ?? null,
+    worker_output_tokens: existing?.worker_output_tokens ?? null,
+    worker_cost_usd: existing?.worker_cost_usd ?? null,
+    background: {
+      no_wait: true,
+      started_at: params.created_at,
+      events_path: path.relative(params.root, params.events_path),
+      stderr_path: stderrRel,
+    },
+    error: null,
+  };
+}
+
+export function summarizeWorkerStatus(
+  result: any,
+  options: {
+    eventsText?: string | null;
+    stderrText?: string | null;
+    now?: string;
+    recentLineCount?: number;
+    active?: boolean;
+  } = {},
+) {
+  const now = options.now ?? new Date().toISOString();
+  const startedAt = result.background?.started_at ?? result.created_at ?? result.updated_at;
+  const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
+  const nowMs = new Date(now).getTime();
+  const eventsSummary = parseWorkerEvents(options.eventsText ?? null);
+  const workerToolCalls = eventsSummary.tool_calls.length ? eventsSummary.tool_calls : result.worker_tool_calls ?? [];
+
+  return {
+    task_id: result.task_id,
+    worker_agent: result.worker_agent ?? null,
+    status: result.status,
+    active: options.active ?? (result.status === "running" || result.status === "revising"),
+    started_at: startedAt ?? null,
+    updated_at: result.updated_at ?? null,
+    elapsed_ms: Number.isFinite(startedMs) && Number.isFinite(nowMs) ? Math.max(0, nowMs - startedMs) : null,
+    run_cwd: result.run_cwd ?? null,
+    worktree_path: result.worktree_path ?? null,
+    events_path: result.events_path ?? null,
+    revision_events_paths: result.revision_events_paths ?? [],
+    stderr_paths: result.stderr_paths ?? [],
+    revision_stderr_paths: result.revision_stderr_paths ?? [],
+    worker_summary: eventsSummary.final_message ?? result.worker_summary ?? null,
+    worker_stop_reason: eventsSummary.stop_reason ?? result.worker_stop_reason ?? null,
+    worker_tool_calls: workerToolCalls,
+    worker_error_event: eventsSummary.error_event ?? result.worker_error_event ?? null,
+    recent_events: extractRecentLines(options.eventsText, options.recentLineCount ?? 10),
+    recent_stderr: extractRecentLines(options.stderrText, options.recentLineCount ?? 10),
+    error: result.error ?? null,
+  };
+}
+
+async function loadInjectedContextFiles(params: {
+  root: string;
+  skill_paths?: string[];
+  context_files?: string[];
+  max_bytes?: number;
+}): Promise<InjectedContextFile[]> {
+  const maxBytes = params.max_bytes ?? defaultMaxContextFileBytes();
+
+  async function loadOne(kind: "skill" | "context", inputPath: string): Promise<InjectedContextFile> {
+    const resolved = kind === "context"
+      ? await resolveInside(params.root, inputPath)
+      : path.resolve(params.root, inputPath);
+    const st = await lstat(resolved);
+    if (!st.isFile()) {
+      throw new Error(`${kind === "skill" ? "skill_paths" : "context_files"} entry is not a file: ${inputPath}`);
+    }
+
+    const data = await readFile(resolved);
+    const originalBytes = data.byteLength;
+    const truncated = originalBytes > maxBytes;
+    const included = truncated ? data.subarray(0, maxBytes) : data;
+    const content = included.toString("utf8") +
+      (truncated ? `\n\n[truncated ${originalBytes - maxBytes} bytes; increase WORKER_MAX_CONTEXT_FILE_BYTES to include more]` : "");
+
+    return {
+      kind,
+      path: resolved,
+      content,
+      truncated,
+      original_bytes: originalBytes,
+      included_bytes: included.byteLength,
+    };
+  }
+
+  const skills = await Promise.all((params.skill_paths ?? []).map((file) => loadOne("skill", file)));
+  const contexts = await Promise.all((params.context_files ?? []).map((file) => loadOne("context", file)));
+  return [...skills, ...contexts];
+}
+
 function taskMarkdown(params: {
   task_id: string;
   worker_agent: string;
   instructions: string;
   allowed_files?: string[];
   forbidden_files?: string[];
+  injected_context_markdown?: string;
 }) {
   const allowed = params.allowed_files?.length
     ? params.allowed_files.map((f) => `- ${f}`).join("\n")
@@ -518,6 +820,8 @@ ${params.worker_agent}
 ## Instructions
 
 ${params.instructions}
+
+${params.injected_context_markdown ? `${params.injected_context_markdown}\n` : ""}
 
 ## Allowed Files
 
@@ -696,8 +1000,9 @@ async function runWorkerInternal(options: WorkerRunOptions) {
   const isRevision = options.run_label === "revision";
 
   const { command, args_prefix } = getAcpxCommand();
-  const events_path = path.join(resultDir, `${options.task_id}.${options.run_label}.events.ndjson`);
-  const stderr_path = path.join(resultDir, `${options.task_id}.${options.run_label}.stderr.log`);
+  const artifactLabel = artifactLabelForRun(options.run_label, options.revision_count);
+  const events_path = path.join(resultDir, `${options.task_id}.${artifactLabel}.events.ndjson`);
+  const stderr_path = path.join(resultDir, `${options.task_id}.${artifactLabel}.stderr.log`);
 
   // Build result skeleton before acpx so we can write even on failure
   const result_path = path.join(resultDir, `${options.task_id}.result.json`);
@@ -775,6 +1080,9 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       policy: existing?.policy ?? { forbidden_file_modified: false, outside_allowed_files: false, violations: [] },
       allowed_files: options.allowed_files ?? existing?.allowed_files ?? null,
       forbidden_files: options.forbidden_files ?? existing?.forbidden_files ?? null,
+      skill_paths: options.skill_paths ?? existing?.skill_paths ?? null,
+      context_files: options.context_files ?? existing?.context_files ?? null,
+      injected_context_files: options.injected_context_files ?? existing?.injected_context_files ?? [],
       acpx: null,
       test: existing?.test ?? null,
       git: null,
@@ -801,8 +1109,8 @@ async function runWorkerInternal(options: WorkerRunOptions) {
   eventsSummary = parseWorkerEvents(eventsText);
 
   // Run test command if specified
-  const test_log_path = path.join(resultDir, `${options.task_id}.${options.run_label}.test.log`);
-  const test_stderr_path = path.join(resultDir, `${options.task_id}.${options.run_label}.test.stderr.log`);
+  const test_log_path = path.join(resultDir, `${options.task_id}.${artifactLabel}.test.log`);
+  const test_stderr_path = path.join(resultDir, `${options.task_id}.${artifactLabel}.test.stderr.log`);
   if (options.test_command) {
     const testCmd = typeof options.test_command === "string"
       ? { cmd: options.test_command, args: [] as string[], shell: true as const }
@@ -888,6 +1196,9 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     policy,
     allowed_files: options.allowed_files ?? existing?.allowed_files ?? null,
     forbidden_files: options.forbidden_files ?? existing?.forbidden_files ?? null,
+    skill_paths: options.skill_paths ?? existing?.skill_paths ?? null,
+    context_files: options.context_files ?? existing?.context_files ?? null,
+    injected_context_files: options.injected_context_files ?? existing?.injected_context_files ?? [],
     acpx: {
       command: acpx.command,
       args: acpx.args,
@@ -930,12 +1241,40 @@ async function runWorkerInternal(options: WorkerRunOptions) {
   return result;
 }
 
+async function writeBackgroundFailureResult(root: string, task_id: string, resultPath: string, err: any) {
+  const existing = await loadExistingResult(root, task_id);
+  const now = new Date().toISOString();
+  const failed = {
+    ...(existing ?? { task_id }),
+    status: "failed",
+    updated_at: now,
+    error: {
+      message: `background worker failed: ${err?.message ?? String(err)}`,
+      exit_code: null,
+      stderr_path: existing?.background?.stderr_path ?? null,
+    },
+  };
+  await writeFile(resultPath, JSON.stringify(failed, null, 2));
+}
+
+function launchBackgroundWorker(root: string, task_id: string, resultPath: string, workerPromise: Promise<unknown>) {
+  const started_at = new Date().toISOString();
+  const key = `${root}:${task_id}`;
+  const promise = workerPromise
+    .catch((err) => writeBackgroundFailureResult(root, task_id, resultPath, err))
+    .finally(() => {
+      activeBackgroundJobs.delete(key);
+    });
+  activeBackgroundJobs.set(key, { started_at, task_id, promise });
+}
+
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
 const StructuredTestCommandSchema = z.union([
   z.string().min(1),
   z.object({ cmd: z.string().min(1), args: z.array(z.string()) }),
 ]);
+const ContextPathListSchema = z.array(z.string().min(1).max(4096)).max(20);
 
 server.tool(
   "run_worker",
@@ -947,6 +1286,8 @@ server.tool(
     instructions: z.string().min(1).describe("Task instructions for the worker agent."),
     allowed_files: z.array(z.string()).optional(),
     forbidden_files: z.array(z.string()).optional(),
+    skill_paths: ContextPathListSchema.optional().describe("Skill files to inject into the worker prompt. Absolute paths are supported, e.g. /Users/me/.codex/skills/foo/SKILL.md."),
+    context_files: ContextPathListSchema.optional().describe("Repository files to inject into the worker prompt. Paths must stay inside cwd."),
     worker_cwd: z.string().optional().describe("Directory for acpx --cwd, relative to cwd. Defaults to cwd."),
     isolate_worktree: z.boolean().default(false),
     force_recreate_worktree: z.boolean().default(false).describe("If true and worktree exists, remove and recreate it."),
@@ -955,16 +1296,12 @@ server.tool(
     mode: RunModeSchema,
     approval: ApprovalSchema,
     json_strict: z.boolean().default(true),
-    no_wait: z.boolean().default(false).describe("DEPRECATED: not supported yet. Will return an error if set to true."),
+    no_wait: z.boolean().default(false).describe("If true, start the worker in the background, write a running result JSON, and return immediately. Poll with get_worker_status or watch_worker."),
     capture_diff: z.boolean().default(true),
     test_command: StructuredTestCommandSchema.optional().describe("Optional command to run after acpx. String form: 'npm test -- auth' (runs via shell). Object form: {cmd:'npm', args:['test','--','auth']} (no shell, safer)."),
     timeout_ms: z.number().int().positive().max(86_400_000).default(defaultTimeoutMs()),
   },
   async (input) => {
-    if (input.no_wait) {
-      return textResult({ error: "no_wait is not currently supported. Set no_wait=false." });
-    }
-
     const root = await repoRootFrom(input.cwd);
     const agentDir = path.join(root, ".agent");
     const taskDir = path.join(agentDir, "tasks");
@@ -981,6 +1318,12 @@ server.tool(
 
     // Load previous result to warn on overwrite and preserve history
     const existingResult = await loadExistingResult(root, input.task_id);
+    const injectedContextFiles = await loadInjectedContextFiles({
+      root,
+      skill_paths: input.skill_paths,
+      context_files: input.context_files,
+    });
+    const injectedContextMarkdown = buildInjectedContextMarkdown(injectedContextFiles);
 
     const taskFile = path.join(taskDir, `${input.task_id}.md`);
     await writeFile(
@@ -991,10 +1334,11 @@ server.tool(
         instructions: input.instructions,
         allowed_files: input.allowed_files,
         forbidden_files: input.forbidden_files,
+        injected_context_markdown: injectedContextMarkdown,
       }),
     );
 
-    const result = await runWorkerInternal({
+    const workerOptions: WorkerRunOptions = {
       cwd: root,
       worker_agent: input.worker_agent,
       task_id: input.task_id,
@@ -1012,10 +1356,53 @@ server.tool(
       run_label: "run",
       allowed_files: input.allowed_files,
       forbidden_files: input.forbidden_files,
+      skill_paths: input.skill_paths,
+      context_files: input.context_files,
+      injected_context_files: injectedContextFiles,
       revision_count: 0,
       worktree_path,
       existing_result: existingResult,
-    });
+    };
+
+    if (input.no_wait) {
+      const artifactLabel = artifactLabelForRun("run", 0);
+      const resultPath = path.join(resultDir, `${input.task_id}.result.json`);
+      const eventsPath = path.join(resultDir, `${input.task_id}.${artifactLabel}.events.ndjson`);
+      const stderrPath = path.join(resultDir, `${input.task_id}.${artifactLabel}.stderr.log`);
+      const running = buildRunningWorkerResult({
+        task_id: input.task_id,
+        worker_agent: input.worker_agent,
+        root,
+        run_cwd,
+        prompt_file: taskFile,
+        result_path: resultPath,
+        events_path: eventsPath,
+        stderr_path: stderrPath,
+        run_label: "run",
+        created_at: new Date().toISOString(),
+        mode: input.mode,
+        approval: input.approval,
+        json_strict: input.json_strict,
+        timeout_ms: input.timeout_ms,
+        capture_diff: input.capture_diff,
+        session: input.session ?? null,
+        model: input.model ?? null,
+        test_command: input.test_command ?? null,
+        allowed_files: input.allowed_files ?? null,
+        forbidden_files: input.forbidden_files ?? null,
+        skill_paths: input.skill_paths ?? null,
+        context_files: input.context_files ?? null,
+        injected_context_files: injectedContextFiles,
+        worktree_path,
+        existing_result: existingResult,
+        revision_count: 0,
+      });
+      await writeFile(resultPath, JSON.stringify(running, null, 2));
+      launchBackgroundWorker(root, input.task_id, resultPath, runWorkerInternal(workerOptions));
+      return textResult(running);
+    }
+
+    const result = await runWorkerInternal(workerOptions);
 
     return textResult(result);
   },
@@ -1031,22 +1418,20 @@ server.tool(
     review_feedback: z.string().min(1).describe("Blocking review feedback from the upstream reviewer agent."),
     allowed_files: z.array(z.string()).optional().describe("Override allowed files. Defaults to original task's allowed_files."),
     forbidden_files: z.array(z.string()).optional().describe("Override forbidden files. Defaults to original task's forbidden_files."),
+    skill_paths: ContextPathListSchema.optional().describe("Override or provide skill files to inject into the revision prompt. Defaults to original task's skill_paths."),
+    context_files: ContextPathListSchema.optional().describe("Override or provide repository files to inject into the revision prompt. Defaults to original task's context_files."),
     worker_cwd: z.string().optional(),
     session: z.string().optional(),
     model: z.string().optional().describe("Model id for the worker agent. Passed as --model to acpx."),
     mode: RunModeSchema,
     approval: ApprovalSchema,
     json_strict: z.boolean().default(true),
-    no_wait: z.boolean().default(false).describe("DEPRECATED: not supported yet. Will return an error if set to true."),
+    no_wait: z.boolean().default(false).describe("If true, start the revision in the background, write a revising result JSON, and return immediately. Poll with get_worker_status or watch_worker."),
     capture_diff: z.boolean().default(true),
     test_command: StructuredTestCommandSchema.optional().describe("Optional test command. Defaults to original task's test_command."),
     timeout_ms: z.number().int().positive().max(86_400_000).default(defaultTimeoutMs()),
   },
   async (input) => {
-    if (input.no_wait) {
-      return textResult({ error: "no_wait is not currently supported. Set no_wait=false." });
-    }
-
     const root = await repoRootFrom(input.cwd);
     const existing = await loadExistingResult(root, input.task_id);
 
@@ -1074,9 +1459,20 @@ server.tool(
     const reviewFile = path.join(reviewsDir, `${input.task_id}.md`);
     await writeFile(reviewFile, input.review_feedback);
 
+    const worktree_path = existing?.worktree_path ?? null;
+    const revision_count = Number.isFinite(existing?.revision_count) ? existing.revision_count + 1 : 1;
+    const skill_paths = input.skill_paths ?? existing?.skill_paths ?? undefined;
+    const context_files = input.context_files ?? existing?.context_files ?? undefined;
+    const injectedContextFiles = await loadInjectedContextFiles({
+      root,
+      skill_paths,
+      context_files,
+    });
+    const injectedContextMarkdown = buildInjectedContextMarkdown(injectedContextFiles);
     const originalTask = await readFile(taskFile, "utf8");
-    const revisionPrompt = `# Original Task\n\n${originalTask}\n\n# Review Feedback\n\n${input.review_feedback}\n\n# Revision Instructions\n\nFix only the blocking issues identified by the reviewer. Do not perform unrelated refactors. Do not modify forbidden files. Keep the patch minimal and focused. When finished, summarize changed files, tests run, and remaining risks.\n`;
-    const revisionPromptFile = path.join(resultDir, `${input.task_id}.revise.prompt.md`);
+    const revisionPrompt = `# Original Task\n\n${originalTask}\n\n# Review Feedback\n\n${input.review_feedback}\n\n${injectedContextMarkdown ? `${injectedContextMarkdown}\n\n` : ""}# Revision Instructions\n\nFix only the blocking issues identified by the reviewer. Do not perform unrelated refactors. Do not modify forbidden files. Keep the patch minimal and focused. When finished, summarize changed files, tests run, and remaining risks.\n`;
+    const revisionLabel = artifactLabelForRun("revision", revision_count);
+    const revisionPromptFile = path.join(resultDir, `${input.task_id}.${revisionLabel}.prompt.md`);
     await writeFile(revisionPromptFile, revisionPrompt);
 
     const run_cwd = input.worker_cwd
@@ -1090,10 +1486,7 @@ server.tool(
     const forbidden_files = input.forbidden_files ?? existing?.forbidden_files ?? undefined;
     const test_command = input.test_command ?? existing?.test_command ?? undefined;
 
-    const worktree_path = existing?.worktree_path ?? null;
-    const revision_count = Number.isFinite(existing?.revision_count) ? existing.revision_count + 1 : 1;
-
-    const result = await runWorkerInternal({
+    const workerOptions: WorkerRunOptions = {
       cwd: root,
       worker_agent: input.worker_agent,
       task_id: input.task_id,
@@ -1111,10 +1504,52 @@ server.tool(
       run_label: "revision",
       allowed_files,
       forbidden_files,
+      skill_paths,
+      context_files,
+      injected_context_files: injectedContextFiles,
       revision_count,
       worktree_path,
       existing_result: existing,
-    });
+    };
+
+    if (input.no_wait) {
+      const resultPath = path.join(resultDir, `${input.task_id}.result.json`);
+      const eventsPath = path.join(resultDir, `${input.task_id}.${revisionLabel}.events.ndjson`);
+      const stderrPath = path.join(resultDir, `${input.task_id}.${revisionLabel}.stderr.log`);
+      const revising = buildRunningWorkerResult({
+        task_id: input.task_id,
+        worker_agent: input.worker_agent,
+        root,
+        run_cwd,
+        prompt_file: revisionPromptFile,
+        result_path: resultPath,
+        events_path: eventsPath,
+        stderr_path: stderrPath,
+        run_label: "revision",
+        created_at: new Date().toISOString(),
+        mode: input.mode,
+        approval: input.approval,
+        json_strict: input.json_strict,
+        timeout_ms: input.timeout_ms,
+        capture_diff: input.capture_diff,
+        session: input.session ?? existing?.session ?? null,
+        model: input.model ?? existing?.model ?? null,
+        test_command,
+        allowed_files,
+        forbidden_files,
+        skill_paths,
+        context_files,
+        injected_context_files: injectedContextFiles,
+        worktree_path,
+        existing_result: existing,
+        revision_count,
+      });
+      await writeFile(resultPath, JSON.stringify(revising, null, 2));
+      launchBackgroundWorker(root, input.task_id, resultPath, runWorkerInternal(workerOptions));
+      return textResult(revising);
+    }
+
+    const result = await runWorkerInternal(workerOptions);
 
     return textResult(result);
   },
@@ -1151,13 +1586,6 @@ server.tool(
       });
     }
 
-    // Use paths from result JSON (which are accurate for both run and revision)
-    const abs = (rel: string) => path.join(root, rel);
-    const resolvePath = (key: string, fallback: string) => {
-      const p = parsed[key];
-      return p ? abs(p) : abs(fallback);
-    };
-
     function truncRead(text: string | null, limit: number): { value: string | null; truncated: boolean } {
       if (!text) return { value: null, truncated: false };
       const truncated = text.length > limit;
@@ -1169,17 +1597,23 @@ server.tool(
       };
     }
 
-    const diffRaw = input.include_diff ? await readTextIfExists(resolvePath("diff_path", path.join(resultDir, `${input.task_id}.diff`)), 2_000_000) : null;
-    const runEventsRaw = input.include_events ? await readTextIfExists(resolvePath("events_path", path.join(resultDir, `${input.task_id}.run.events.ndjson`)), 2_000_000) : null;
-    const revEventsLatest = parsed.revision_events_paths?.slice(-1)[0];
-    const revEventsRaw = input.include_events && revEventsLatest ? await readTextIfExists(abs(revEventsLatest), 2_000_000) : null;
-    const runTestRaw = input.include_test_log ? await readTextIfExists(resolvePath("test_log_path", path.join(resultDir, `${input.task_id}.run.test.log`)), 2_000_000) : null;
-    const revTestLatest = parsed.revision_test_log_paths?.slice(-1)[0] ?? parsed.latest_test_log_path;
-    const revTestRaw = input.include_test_log && revTestLatest ? await readTextIfExists(abs(revTestLatest), 2_000_000) : null;
-    const statusRaw = await readTextIfExists(resolvePath("status_path", path.join(resultDir, `${input.task_id}.status.txt`)), 50_000);
-    const runStderrRaw = await readTextIfExists(resolvePath("stderr_paths[0]", path.join(resultDir, `${input.task_id}.run.stderr.log`)), 50_000);
-    const revStderrLatest = parsed.revision_stderr_paths?.slice(-1)[0];
-    const revStderrRaw = revStderrLatest ? await readTextIfExists(abs(revStderrLatest), 50_000) : null;
+    const artifactPaths = selectWorkerResultArtifactPaths(parsed, root, input.task_id);
+    const diffRaw = input.include_diff
+      ? await readTextIfExists(absArtifactPath(root, parsed.diff_path) ?? path.join(resultDir, `${input.task_id}.diff`), 2_000_000)
+      : null;
+    const runEventsRaw = input.include_events ? await readTextIfExists(artifactPaths.runEventsPath, 2_000_000) : null;
+    const revEventsRaw = input.include_events && artifactPaths.latestRevisionEventsPath
+      ? await readTextIfExists(artifactPaths.latestRevisionEventsPath, 2_000_000)
+      : null;
+    const runTestRaw = input.include_test_log ? await readTextIfExists(artifactPaths.runTestLogPath, 2_000_000) : null;
+    const revTestRaw = input.include_test_log && artifactPaths.latestRevisionTestLogPath
+      ? await readTextIfExists(artifactPaths.latestRevisionTestLogPath, 2_000_000)
+      : null;
+    const statusRaw = await readTextIfExists(absArtifactPath(root, parsed.status_path) ?? path.join(resultDir, `${input.task_id}.status.txt`), 50_000);
+    const runStderrRaw = await readTextIfExists(artifactPaths.runStderrPath, 50_000);
+    const revStderrRaw = artifactPaths.latestRevisionStderrPath
+      ? await readTextIfExists(artifactPaths.latestRevisionStderrPath, 50_000)
+      : null;
 
     const diffResult = truncRead(diffRaw, maxChars);
     const runEventsResult = truncRead(runEventsRaw, maxChars);
@@ -1225,6 +1659,91 @@ server.tool(
     };
 
     return textResult(out);
+  },
+);
+
+server.tool(
+  "get_worker_status",
+  "Return the current status of a worker task, including elapsed time, recent acpx event/stderr lines, tool calls, and error details. Useful for polling no_wait tasks.",
+  {
+    task_id: TaskIdSchema,
+    cwd: z.string().optional(),
+    recent_lines: z.number().int().positive().max(100).default(10),
+    max_bytes: z.number().int().positive().max(1_000_000).default(200_000),
+  },
+  async (input) => {
+    const root = await repoRootFrom(input.cwd);
+    const existing = await loadExistingResult(root, input.task_id);
+    if (!existing) {
+      return textResult({
+        task_id: input.task_id,
+        status: "missing_result",
+        error: `No result found for task '${input.task_id}'. Run 'run_worker' first.`,
+      });
+    }
+
+    const paths = selectWorkerResultArtifactPaths(existing, root, input.task_id);
+    const useRevisionLogs = (existing.status === "revising" || existing.status === "revised") && paths.latestRevisionEventsPath;
+    const eventsPath = useRevisionLogs ? paths.latestRevisionEventsPath : paths.runEventsPath;
+    const stderrPath = useRevisionLogs && paths.latestRevisionStderrPath ? paths.latestRevisionStderrPath : paths.runStderrPath;
+    const [eventsText, stderrText] = await Promise.all([
+      eventsPath ? readTextIfExists(eventsPath, input.max_bytes) : Promise.resolve(null),
+      stderrPath ? readTextIfExists(stderrPath, Math.min(input.max_bytes, 200_000)) : Promise.resolve(null),
+    ]);
+    const key = `${root}:${input.task_id}`;
+
+    return textResult(summarizeWorkerStatus(existing, {
+      eventsText,
+      stderrText,
+      recentLineCount: input.recent_lines,
+      active: activeBackgroundJobs.has(key) || existing.status === "running" || existing.status === "revising",
+    }));
+  },
+);
+
+server.tool(
+  "watch_worker",
+  "Return a larger recent tail of worker acpx events and stderr for a task. This is a polling-friendly watch helper, not a streaming subscription.",
+  {
+    task_id: TaskIdSchema,
+    cwd: z.string().optional(),
+    lines: z.number().int().positive().max(500).default(50),
+    include_result: z.boolean().default(false),
+    max_bytes: z.number().int().positive().max(2_000_000).default(500_000),
+  },
+  async (input) => {
+    const root = await repoRootFrom(input.cwd);
+    const existing = await loadExistingResult(root, input.task_id);
+    if (!existing) {
+      return textResult({
+        task_id: input.task_id,
+        status: "missing_result",
+        error: `No result found for task '${input.task_id}'. Run 'run_worker' first.`,
+      });
+    }
+
+    const paths = selectWorkerResultArtifactPaths(existing, root, input.task_id);
+    const useRevisionLogs = (existing.status === "revising" || existing.status === "revised") && paths.latestRevisionEventsPath;
+    const eventsPath = useRevisionLogs ? paths.latestRevisionEventsPath : paths.runEventsPath;
+    const stderrPath = useRevisionLogs && paths.latestRevisionStderrPath ? paths.latestRevisionStderrPath : paths.runStderrPath;
+    const [eventsText, stderrText] = await Promise.all([
+      eventsPath ? readTextIfExists(eventsPath, input.max_bytes) : Promise.resolve(null),
+      stderrPath ? readTextIfExists(stderrPath, Math.min(input.max_bytes, 500_000)) : Promise.resolve(null),
+    ]);
+    const key = `${root}:${input.task_id}`;
+    const status = summarizeWorkerStatus(existing, {
+      eventsText,
+      stderrText,
+      recentLineCount: input.lines,
+      active: activeBackgroundJobs.has(key) || existing.status === "running" || existing.status === "revising",
+    });
+
+    return textResult({
+      ...status,
+      event_lines: status.recent_events,
+      stderr_lines: status.recent_stderr,
+      result: input.include_result ? existing : undefined,
+    });
   },
 );
 
@@ -1291,6 +1810,289 @@ server.tool(
     }
 
     return textResult(cancelResult);
+  },
+);
+
+server.tool(
+  "validate_acpx",
+  "Run lightweight acpx help checks and report whether the command surface appears compatible with this MCP server.",
+  {
+    worker_agent: WorkerAgentSchema.default(defaultWorkerAgent()),
+    cwd: z.string().optional(),
+    include_exec_help: z.boolean().default(true),
+    timeout_ms: z.number().int().positive().max(300_000).default(60_000),
+  },
+  async (input) => {
+    assertAllowedWorkerAgent(input.worker_agent);
+    const root = await repoRootFrom(input.cwd);
+    const resultDir = path.join(root, ".agent", "results");
+    await ensureDir(resultDir);
+    const { command, args_prefix } = getAcpxCommand();
+
+    async function check(label: string, args: string[], expected_flags: string[]) {
+      const stdout_path = path.join(resultDir, `validate-acpx.${label}.stdout.log`);
+      const stderr_path = path.join(resultDir, `validate-acpx.${label}.stderr.log`);
+      try {
+        const result = await runCommand({
+          command,
+          args: [...args_prefix, ...args],
+          cwd: root,
+          stdout_path,
+          stderr_path,
+          timeout_ms: input.timeout_ms,
+        });
+        const output = `${result.stdout_tail}\n${result.stderr_tail}`;
+        return {
+          label,
+          command,
+          args: [...args_prefix, ...args],
+          ok: result.exit_code === 0 && !result.timed_out,
+          exit_code: result.exit_code,
+          timed_out: result.timed_out,
+          stdout_path: path.relative(root, stdout_path),
+          stderr_path: path.relative(root, stderr_path),
+          expected_flags: summarizeAcpxHelp(output, expected_flags),
+        };
+      } catch (err: any) {
+        return {
+          label,
+          command,
+          args: [...args_prefix, ...args],
+          ok: false,
+          exit_code: null,
+          timed_out: false,
+          stdout_path: path.relative(root, stdout_path),
+          stderr_path: path.relative(root, stderr_path),
+          expected_flags: Object.fromEntries(expected_flags.map((flag) => [flag, false])),
+          error: err.message,
+        };
+      }
+    }
+
+    const checks = [
+      await check("top-help", ["--help"], ["--cwd", "--format", "--timeout"]),
+      await check("agent-help", [input.worker_agent, "--help"], ["exec", "cancel", "-s", "--model"]),
+    ];
+    if (input.include_exec_help) {
+      checks.push(
+        await check("exec-help", [input.worker_agent, "exec", "--help"], [
+          "--file",
+          "--json-strict",
+          "--approve-all",
+          "--approve-reads",
+          "--deny-all",
+        ]),
+      );
+    }
+
+    const missing_flags = checks.flatMap((c) =>
+      Object.entries(c.expected_flags)
+        .filter(([, found]) => !found)
+        .map(([flag]) => ({ check: c.label, flag })),
+    );
+
+    return textResult({
+      status: checks.every((c) => c.ok) && missing_flags.length === 0 ? "compatible" : "needs_review",
+      worker_agent: input.worker_agent,
+      acpx_bin: [command, ...args_prefix].join(" "),
+      checks,
+      missing_flags,
+      note: "Help output can vary by acpx version. Treat this as a compatibility smoke check before running real workers.",
+    });
+  },
+);
+
+server.tool(
+  "apply_worker_patch",
+  "Apply the tracked diff and optional untracked files from an isolated worker worktree back to the main repository working tree.",
+  {
+    task_id: TaskIdSchema,
+    cwd: z.string().optional(),
+    include_untracked: z.boolean().default(true),
+    overwrite_untracked: z.boolean().default(false),
+    check_only: z.boolean().default(false),
+    timeout_ms: z.number().int().positive().max(300_000).default(60_000),
+  },
+  async (input) => {
+    const root = await repoRootFrom(input.cwd);
+    const existing = await loadExistingResult(root, input.task_id);
+    if (!existing) {
+      return textResult({
+        task_id: input.task_id,
+        status: "missing_result",
+        error: `No result found for task '${input.task_id}'. Run 'run_worker' first.`,
+      });
+    }
+
+    const worktreePath = resolveWorktreePathFromResult(existing, root);
+    if (!worktreePath) {
+      return textResult({
+        task_id: input.task_id,
+        status: "not_applicable",
+        error: "This task has no worktree_path. apply_worker_patch only applies isolated worktree results.",
+      });
+    }
+
+    const worktreeReal = await realpath(worktreePath);
+    await assertInside(root, worktreeReal);
+
+    const resultDir = path.join(root, ".agent", "results");
+    await ensureDir(resultDir);
+    const patchPath = path.join(resultDir, `${input.task_id}.apply.patch`);
+
+    const diff = await runCommand({
+      command: "git",
+      args: ["-C", worktreeReal, "diff", "--binary", "HEAD"],
+      cwd: root,
+      stdout_path: patchPath,
+      stderr_path: path.join(resultDir, `${input.task_id}.apply-diff.stderr.log`),
+      timeout_ms: input.timeout_ms,
+    });
+    if (diff.exit_code !== 0) {
+      return textResult({
+        task_id: input.task_id,
+        status: "failed",
+        patch_path: path.relative(root, patchPath),
+        diff,
+        error: "Failed to generate worker patch from the isolated worktree.",
+      });
+    }
+    const patchText = await readTextIfExists(patchPath, 10_000_000);
+    const hasPatch = Boolean(patchText?.trim());
+
+    const untracked = input.include_untracked
+      ? await runCommand({
+          command: "git",
+          args: ["-C", worktreeReal, "ls-files", "--others", "--exclude-standard"],
+          cwd: root,
+          timeout_ms: input.timeout_ms,
+        })
+      : null;
+    if (untracked && untracked.exit_code !== 0) {
+      return textResult({
+        task_id: input.task_id,
+        status: "failed",
+        patch_path: path.relative(root, patchPath),
+        untracked,
+        error: "Failed to list untracked files in the isolated worktree.",
+      });
+    }
+    const untrackedFiles = untracked
+      ? untracked.stdout_tail.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    const copyConflicts: string[] = [];
+    const unsupportedUntrackedFiles: string[] = [];
+    for (const file of untrackedFiles) {
+      const src = path.join(worktreeReal, file);
+      const dest = path.join(root, file);
+      await assertInside(worktreeReal, src);
+      await assertInside(root, dest);
+      const srcStat = await lstat(src);
+      if (!srcStat.isFile()) unsupportedUntrackedFiles.push(file);
+      if (!input.overwrite_untracked && (await exists(dest))) copyConflicts.push(file);
+    }
+
+    if (copyConflicts.length || unsupportedUntrackedFiles.length) {
+      return textResult({
+        task_id: input.task_id,
+        status: "conflict",
+        patch_path: path.relative(root, patchPath),
+        conflicts: copyConflicts,
+        unsupported_untracked_files: unsupportedUntrackedFiles,
+        error: unsupportedUntrackedFiles.length
+          ? "Untracked worker entries must be regular files before they can be copied back."
+          : "Untracked worker files would overwrite existing files. Set overwrite_untracked=true only after review.",
+      });
+    }
+
+    let applyCheck: CommandResult | null = null;
+    let applyResult: CommandResult | null = null;
+    if (hasPatch) {
+      applyCheck = await runCommand({
+        command: "git",
+        args: ["-C", root, "apply", "--check", patchPath],
+        cwd: root,
+        timeout_ms: input.timeout_ms,
+      });
+      if (applyCheck.exit_code !== 0) {
+        return textResult({
+          task_id: input.task_id,
+          status: "conflict",
+          patch_path: path.relative(root, patchPath),
+          apply_check: applyCheck,
+          error: "Worker patch does not apply cleanly to the main working tree.",
+        });
+      }
+
+      if (!input.check_only) {
+        applyResult = await runCommand({
+          command: "git",
+          args: ["-C", root, "apply", patchPath],
+          cwd: root,
+          timeout_ms: input.timeout_ms,
+        });
+        if (applyResult.exit_code !== 0) {
+          return textResult({
+            task_id: input.task_id,
+            status: "failed",
+            patch_path: path.relative(root, patchPath),
+            apply: applyResult,
+            error: "git apply failed after a successful check.",
+          });
+        }
+      }
+    }
+
+    const copied_untracked_files: string[] = [];
+    if (!input.check_only) {
+      for (const file of untrackedFiles) {
+        const src = path.join(worktreeReal, file);
+        const dest = path.join(root, file);
+        await assertInside(worktreeReal, src);
+        await assertInside(root, dest);
+        await ensureDir(path.dirname(dest));
+        await copyFile(src, dest);
+        copied_untracked_files.push(file);
+      }
+    }
+
+    const rootGit = input.check_only
+      ? null
+      : await captureGitArtifacts(root, root, resultDir, input.task_id);
+
+    existing.status = input.check_only ? existing.status : "applied";
+    existing.updated_at = new Date().toISOString();
+    existing.apply = {
+      status: input.check_only ? "checked" : "applied",
+      patch_path: path.relative(root, patchPath),
+      has_patch: hasPatch,
+      include_untracked: input.include_untracked,
+      copied_untracked_files,
+      would_copy_untracked_files: input.check_only ? untrackedFiles : [],
+      apply_check_exit_code: applyCheck?.exit_code ?? null,
+      apply_exit_code: applyResult?.exit_code ?? null,
+    };
+    if (rootGit) {
+      existing.diff_path = path.relative(root, rootGit.diff_path);
+      existing.cached_diff_path = path.relative(root, rootGit.cached_diff_path);
+      existing.status_path = path.relative(root, rootGit.status_path);
+      existing.untracked_path = path.relative(root, rootGit.untracked_path);
+      existing.changed_files_path = path.relative(root, rootGit.changed_files_path);
+      existing.changed_files = rootGit.changed_files;
+    }
+    await writeFile(path.join(resultDir, `${input.task_id}.result.json`), JSON.stringify(existing, null, 2));
+
+    return textResult({
+      task_id: input.task_id,
+      status: input.check_only ? "checked" : "applied",
+      patch_path: path.relative(root, patchPath),
+      has_patch: hasPatch,
+      copied_untracked_files,
+      would_copy_untracked_files: input.check_only ? untrackedFiles : [],
+      apply_check_exit_code: applyCheck?.exit_code ?? null,
+      apply_exit_code: applyResult?.exit_code ?? null,
+    });
   },
 );
 
