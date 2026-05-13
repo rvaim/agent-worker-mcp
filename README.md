@@ -174,6 +174,8 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 re
 
 使用 `watch_worker` 可以展示更完整的最近 events/stderr。它不是流式订阅，而是轮询友好的 watch helper。
 
+当 MCP server 进程结束、收到 `SIGINT` / `SIGTERM`，或 stdio 输入关闭时，server 会取消本次进程启动的后台 worker。取消会通过 `SIGTERM` 发送给对应的 `acpx` 子进程，5 秒后仍未退出则升级为 `SIGKILL`；result JSON 会更新为 `cancelled` 并记录取消原因。这个清理只作用于当前 MCP server 进程亲自启动的后台任务，不会按进程名误杀用户在其他终端或其他会话中启动的 Claude。
+
 ## 示例：revise_worker
 
 ```json

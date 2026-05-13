@@ -5,7 +5,9 @@ import {
   artifactLabelForRun,
   buildInjectedContextMarkdown,
   buildRunningWorkerResult,
+  cancelActiveBackgroundWorkers,
   extractRecentLines,
+  launchBackgroundWorker,
   resolveWorktreePathFromResult,
   selectWorkerResultArtifactPaths,
   summarizeAcpxHelp,
@@ -185,5 +187,31 @@ describe("summarizeWorkerStatus", () => {
     expect(status.recent_events).toEqual(['{"type":"start"}', '{"type":"tool_call","name":"Read File"}']);
     expect(status.recent_stderr).toEqual(["warning"]);
     expect(status.worker_tool_calls).toEqual(["Read File"]);
+  });
+});
+
+describe("background worker cancellation", () => {
+  it("cancels tracked background workers on server shutdown", () => {
+    const controller = new AbortController();
+    let cancelReason: string | undefined;
+
+    launchBackgroundWorker(
+      "/repo",
+      "task-bg-cancel",
+      "/repo/.agent/results/task-bg-cancel.result.json",
+      new Promise(() => {}),
+      {
+        abortController: controller,
+        onCancel: (reason) => {
+          cancelReason = reason;
+        },
+      },
+    );
+
+    const cancelled = cancelActiveBackgroundWorkers("test shutdown");
+
+    expect(cancelled).toBe(1);
+    expect(controller.signal.aborted).toBe(true);
+    expect(cancelReason).toBe("test shutdown");
   });
 });

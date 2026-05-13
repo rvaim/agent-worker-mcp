@@ -38,6 +38,8 @@ type CommandResult = {
   stderr_path?: string;
   stdout_tail: string;
   stderr_tail: string;
+  cancelled?: boolean;
+  cancel_reason?: string | null;
 };
 
 type PolicyViolation = {
@@ -84,6 +86,7 @@ type WorkerRunOptions = {
   revision_count?: number;
   worktree_path?: string | null;
   existing_result?: any | null;
+  abort_signal?: AbortSignal;
 };
 
 type RunningWorkerResultParams = {
@@ -161,7 +164,14 @@ const envApproval = ["all", "reads", "deny"].includes(process.env.ACPX_APPROVAL 
   : "all";
 const ApprovalSchema = z.enum(["all", "reads", "deny"]).default(envApproval);
 const RunModeSchema = z.enum(["exec", "session"]).default("exec");
-const activeBackgroundJobs = new Map<string, { started_at: string; task_id: string; promise: Promise<unknown> }>();
+type ActiveBackgroundJob = {
+  started_at: string;
+  task_id: string;
+  promise: Promise<unknown>;
+  cancel: (reason: string) => void;
+};
+
+const activeBackgroundJobs = new Map<string, ActiveBackgroundJob>();
 
 function textResult(value: unknown) {
   return {
@@ -256,6 +266,7 @@ async function runCommand(params: {
   timeout_ms?: number;
   env?: NodeJS.ProcessEnv;
   shell?: boolean;
+  abort_signal?: AbortSignal;
 }): Promise<CommandResult> {
   if (params.stdout_path) await ensureDir(path.dirname(params.stdout_path));
   if (params.stderr_path) await ensureDir(path.dirname(params.stderr_path));
@@ -264,6 +275,9 @@ async function runCommand(params: {
   let stdout_tail = "";
   let stderr_tail = "";
   let timed_out = false;
+  let cancelled = false;
+  let cancel_reason: string | null = null;
+  let killTimer: NodeJS.Timeout | undefined;
 
   const child = spawn(params.command, params.args, {
     cwd: params.cwd,
@@ -271,6 +285,24 @@ async function runCommand(params: {
     shell: params.shell ?? false,
     stdio: ["ignore", "pipe", "pipe"],
   });
+
+  const terminateChild = (reason: string) => {
+    cancelled = true;
+    cancel_reason = reason;
+    if (child.exitCode !== null || child.killed) return;
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    killTimer.unref();
+  };
+
+  const onAbort = () => {
+    terminateChild(String(params.abort_signal?.reason ?? "cancelled"));
+  };
+  if (params.abort_signal?.aborted) {
+    onAbort();
+  } else {
+    params.abort_signal?.addEventListener("abort", onAbort, { once: true });
+  }
 
   const stdoutStream = params.stdout_path ? createWriteStream(params.stdout_path) : undefined;
   const stderrStream = params.stderr_path ? createWriteStream(params.stderr_path) : undefined;
@@ -287,8 +319,7 @@ async function runCommand(params: {
   const timer = params.timeout_ms
     ? setTimeout(() => {
         timed_out = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
+        terminateChild("timeout");
       }, params.timeout_ms)
     : undefined;
 
@@ -300,6 +331,8 @@ async function runCommand(params: {
   );
 
   if (timer) clearTimeout(timer);
+  if (killTimer) clearTimeout(killTimer);
+  params.abort_signal?.removeEventListener("abort", onAbort);
   await Promise.all([
     stdoutStream ? new Promise<void>((resolve) => stdoutStream.end(resolve)) : Promise.resolve(),
     stderrStream ? new Promise<void>((resolve) => stderrStream.end(resolve)) : Promise.resolve(),
@@ -317,6 +350,8 @@ async function runCommand(params: {
     stderr_path: params.stderr_path,
     stdout_tail,
     stderr_tail,
+    cancelled,
+    cancel_reason,
   };
 }
 
@@ -1041,6 +1076,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       stdout_path: events_path,
       stderr_path,
       timeout_ms: options.timeout_ms,
+      abort_signal: options.abort_signal,
     });
   } catch (err: any) {
     // Write failure result even when spawn crashes
@@ -1123,6 +1159,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       stderr_path: test_stderr_path,
       timeout_ms: options.timeout_ms,
       shell: testCmd.shell,
+      abort_signal: options.abort_signal,
     });
   }
 
@@ -1138,7 +1175,11 @@ async function runWorkerInternal(options: WorkerRunOptions) {
   });
 
   // Determine status
-  const status = acpx.exit_code === 0 && !acpx.timed_out ? "completed" : "failed";
+  const status = acpx.exit_code === 0 && !acpx.timed_out && !acpx.cancelled
+    ? "completed"
+    : acpx.cancelled && !acpx.timed_out
+      ? "cancelled"
+      : "failed";
   const finalStatus = isRevision && status === "completed" ? "revised" : status;
 
   // Accumulate revision paths
@@ -1209,6 +1250,8 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       duration_ms: acpx.duration_ms,
       stdout_path: acpx.stdout_path,
       stderr_path: acpx.stderr_path,
+      cancelled: acpx.cancelled ?? false,
+      cancel_reason: acpx.cancel_reason ?? null,
     },
     test: test ?? null,
     git: git
@@ -1228,9 +1271,13 @@ async function runWorkerInternal(options: WorkerRunOptions) {
     worker_output_tokens: eventsSummary?.output_tokens ?? existing?.worker_output_tokens ?? null,
     worker_cost_usd: eventsSummary?.cost_usd ?? existing?.worker_cost_usd ?? null,
     error:
-      status === "failed"
+      status === "failed" || status === "cancelled"
         ? {
-            message: acpx.timed_out ? "acpx timed out" : `acpx exited with code ${acpx.exit_code}`,
+            message: acpx.timed_out
+              ? "acpx timed out"
+              : status === "cancelled"
+                ? `acpx cancelled: ${acpx.cancel_reason ?? "cancelled"}`
+                : `acpx exited with code ${acpx.exit_code}`,
             exit_code: acpx.exit_code,
             stderr_path: path.relative(root, stderr_path),
           }
@@ -1257,7 +1304,16 @@ async function writeBackgroundFailureResult(root: string, task_id: string, resul
   await writeFile(resultPath, JSON.stringify(failed, null, 2));
 }
 
-function launchBackgroundWorker(root: string, task_id: string, resultPath: string, workerPromise: Promise<unknown>) {
+export function launchBackgroundWorker(
+  root: string,
+  task_id: string,
+  resultPath: string,
+  workerPromise: Promise<unknown>,
+  options: {
+    abortController?: AbortController;
+    onCancel?: (reason: string) => void;
+  } = {},
+) {
   const started_at = new Date().toISOString();
   const key = `${root}:${task_id}`;
   const promise = workerPromise
@@ -1265,7 +1321,22 @@ function launchBackgroundWorker(root: string, task_id: string, resultPath: strin
     .finally(() => {
       activeBackgroundJobs.delete(key);
     });
-  activeBackgroundJobs.set(key, { started_at, task_id, promise });
+  const cancel = (reason: string) => {
+    options.onCancel?.(reason);
+    if (!options.abortController?.signal.aborted) {
+      options.abortController?.abort(reason);
+    }
+    activeBackgroundJobs.delete(key);
+  };
+  activeBackgroundJobs.set(key, { started_at, task_id, promise, cancel });
+}
+
+export function cancelActiveBackgroundWorkers(reason = "MCP server shutdown cancelled background worker"): number {
+  const jobs = [...activeBackgroundJobs.values()];
+  for (const job of jobs) {
+    job.cancel(reason);
+  }
+  return jobs.length;
 }
 
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
@@ -1398,7 +1469,14 @@ server.tool(
         revision_count: 0,
       });
       await writeFile(resultPath, JSON.stringify(running, null, 2));
-      launchBackgroundWorker(root, input.task_id, resultPath, runWorkerInternal(workerOptions));
+      const abortController = new AbortController();
+      launchBackgroundWorker(
+        root,
+        input.task_id,
+        resultPath,
+        runWorkerInternal({ ...workerOptions, abort_signal: abortController.signal }),
+        { abortController },
+      );
       return textResult(running);
     }
 
@@ -1545,7 +1623,14 @@ server.tool(
         revision_count,
       });
       await writeFile(resultPath, JSON.stringify(revising, null, 2));
-      launchBackgroundWorker(root, input.task_id, resultPath, runWorkerInternal(workerOptions));
+      const abortController = new AbortController();
+      launchBackgroundWorker(
+        root,
+        input.task_id,
+        resultPath,
+        runWorkerInternal({ ...workerOptions, abort_signal: abortController.signal }),
+        { abortController },
+      );
       return textResult(revising);
     }
 
@@ -2186,7 +2271,40 @@ server.tool(
   },
 );
 
+let shutdownHandlersInstalled = false;
+
+function installBackgroundWorkerShutdownHandlers() {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+
+  const cancelFor = (reason: string) => {
+    const count = cancelActiveBackgroundWorkers(reason);
+    if (count > 0) {
+      console.error(`[${SERVER_NAME}] cancelled ${count} background worker(s): ${reason}`);
+    }
+  };
+
+  process.once("SIGINT", () => {
+    cancelFor("MCP server received SIGINT");
+    process.exit(130);
+  });
+  process.once("SIGTERM", () => {
+    cancelFor("MCP server received SIGTERM");
+    process.exit(143);
+  });
+  process.once("beforeExit", () => {
+    cancelFor("MCP server beforeExit");
+  });
+  process.stdin.once("end", () => {
+    cancelFor("MCP server stdin ended");
+  });
+  process.stdin.once("close", () => {
+    cancelFor("MCP server stdin closed");
+  });
+}
+
 async function main() {
+  installBackgroundWorkerShutdownHandlers();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
