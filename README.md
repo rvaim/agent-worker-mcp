@@ -1,6 +1,6 @@
-# agent-worker-mcp
+# @rvaim/agent-worker-mcp
 
-`agent-worker-mcp` 是一个通过 [`acpx`](https://github.com/openclaw/acpx) 做 **agent-to-agent 任务委托** 的通用 MCP 服务器。
+`@rvaim/agent-worker-mcp` 是一个通过 [`acpx`](https://github.com/openclaw/acpx) 做 **agent-to-agent 任务委托** 的通用 MCP 服务器。
 
 它让任意 MCP 客户端里的上游 agent 充当 leader / reviewer，把实现任务委托给 `acpx` 支持的 ACP worker agent，例如 Claude、Gemini、Codex、OpenCode、Qwen、Kimi 或其他兼容 ACP 的 agent。
 
@@ -64,6 +64,21 @@ MCP 暴露的工具：
 - 全局可用的 `acpx`，或设置 `ACPX_BIN="npx -y acpx@latest"`
 - 已为要使用的 worker agent 配好认证，例如 Claude、Gemini、OpenCode、Qwen、Kimi 或自定义 ACP agent
 
+推荐直接通过 npm 包运行：
+
+```bash
+npx -y @rvaim/agent-worker-mcp
+```
+
+也可以全局安装：
+
+```bash
+npm install -g @rvaim/agent-worker-mcp
+agent-worker-mcp
+```
+
+本地开发：
+
 ```bash
 npm install
 npm run build
@@ -81,8 +96,8 @@ stdio MCP 配置示例：
 
 ```toml
 [mcp_servers.agent_worker]
-command = "node"
-args = ["/absolute/path/to/agent-worker-mcp/dist/index.js"]
+command = "npx"
+args = ["-y", "@rvaim/agent-worker-mcp"]
 startup_timeout_sec = 20
 tool_timeout_sec = 3600
 env_vars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
@@ -95,6 +110,8 @@ ACPX_APPROVAL = "all"
 ```
 
 `tool_timeout_sec` 应足够长。代码任务通常会超过 60 秒，太短会导致上游 MCP client 在 worker 完成前超时。
+
+本地源码开发时，也可以把 `command` 设为 `node`，并把 `args` 指向仓库内的 `dist/index.js`。
 
 ## 示例：run_worker
 
@@ -333,3 +350,24 @@ npm test
 ```
 
 测试使用 [Vitest](https://vitest.dev)，并通过 mock `acpx` 验证关键逻辑，不需要真实 worker agent。
+
+## 发布到 MCP Registry
+
+本仓库已包含官方 MCP Registry 需要的 `server.json`，并在 `package.json` 中设置了匹配的 `mcpName`：
+
+```text
+io.github.rvaim/agent
+```
+
+Registry 名称是这个 MCP server 的稳定身份；npm 包名是其中一种分发方式。本项目的 npm 包名是 `@rvaim/agent-worker-mcp`。
+
+发布流程：
+
+```bash
+npm test
+npm publish --access public
+mcp-publisher login github
+mcp-publisher publish
+```
+
+发布前请确认 `package.json`、`package-lock.json`、`server.json` 中的版本号保持一致。

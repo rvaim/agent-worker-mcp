@@ -257,6 +257,10 @@ async function resolveInside(root: string, maybeRelative: string): Promise<strin
   return resolved;
 }
 
+function relativeResultPath(from: string, to: string): string {
+  return path.relative(from, to).split(path.sep).join("/");
+}
+
 async function runCommand(params: {
   command: string;
   args: string[];
@@ -681,7 +685,8 @@ export function buildRunningWorkerResult(params: RunningWorkerResultParams) {
   const existing = params.existing_result;
   const taskPath = path.join(params.root, ".agent", "tasks", `${params.task_id}.md`);
   const status = isRevision ? "revising" : "running";
-  const stderrRel = path.relative(params.root, params.stderr_path);
+  const stderrRel = relativeResultPath(params.root, params.stderr_path);
+  const eventsRel = relativeResultPath(params.root, params.events_path);
   const priorStderr = existing?.stderr_paths ?? [];
   const priorRevisionStderr = existing?.revision_stderr_paths ?? [];
 
@@ -701,13 +706,13 @@ export function buildRunningWorkerResult(params: RunningWorkerResultParams) {
     json_strict: params.json_strict,
     timeout_ms: params.timeout_ms,
     capture_diff: params.capture_diff,
-    task_path: existing?.task_path ?? path.relative(params.root, taskPath),
-    prompt_file: path.relative(params.root, params.prompt_file),
-    result_path: path.relative(params.root, params.result_path),
-    events_path: existing?.events_path ?? (!isRevision ? path.relative(params.root, params.events_path) : null),
+    task_path: existing?.task_path ?? relativeResultPath(params.root, taskPath),
+    prompt_file: relativeResultPath(params.root, params.prompt_file),
+    result_path: relativeResultPath(params.root, params.result_path),
+    events_path: existing?.events_path ?? (!isRevision ? eventsRel : null),
     revision_events_paths: [
       ...(existing?.revision_events_paths ?? []),
-      ...(isRevision ? [path.relative(params.root, params.events_path)] : []),
+      ...(isRevision ? [eventsRel] : []),
     ],
     stderr_paths: isRevision ? priorStderr : [...priorStderr, stderrRel],
     revision_stderr_paths: isRevision ? [...priorRevisionStderr, stderrRel] : priorRevisionStderr,
@@ -745,7 +750,7 @@ export function buildRunningWorkerResult(params: RunningWorkerResultParams) {
     background: {
       no_wait: true,
       started_at: params.created_at,
-      events_path: path.relative(params.root, params.events_path),
+      events_path: eventsRel,
       stderr_path: stderrRel,
     },
     error: null,

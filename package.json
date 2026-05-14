@@ -1,15 +1,38 @@
 {
-  "name": "agent-worker-mcp",
+  "name": "@rvaim/agent-worker-mcp",
   "version": "0.2.0",
   "description": "Generic MCP server for delegating tasks from one agent to another ACP-compatible worker agent through acpx.",
   "type": "module",
+  "mcpName": "io.github.rvaim/agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rvaim/agent-worker-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rvaim/agent-worker-mcp/issues"
+  },
+  "homepage": "https://github.com/rvaim/agent-worker-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "acpx",
+    "automation"
+  ],
   "bin": {
     "agent-worker-mcp": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -25,6 +48,9 @@
   },
   "engines": {
     "node": ">=20.10.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "MIT"
 }

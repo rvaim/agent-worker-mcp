@@ -1,6 +1,6 @@
 [mcp_servers.agent_worker]
-command = "node"
-args = ["/absolute/path/to/agent-worker-mcp/dist/index.js"]
+command = "npx"
+args = ["-y", "@rvaim/agent-worker-mcp"]
 startup_timeout_sec = 20
 tool_timeout_sec = 3600
 env_vars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
