@@ -141,7 +141,7 @@ function getEnv(name: string, fallbackName?: string): string | undefined {
 }
 
 function defaultWorkerAgent(): string {
-  return getEnv("DEFAULT_WORKER_AGENT", "DEFAULT_ACPX_AGENT") ?? "claude";
+  return getEnv("DEFAULT_WORKER_AGENT") ?? "claude";
 }
 
 function defaultTimeoutMs(): number {
@@ -2269,7 +2269,6 @@ server.tool(
       acpx_bin: process.env.ACPX_BIN ?? "acpx",
       approval_default: process.env.ACPX_APPROVAL ?? "all",
       env_aliases_supported: {
-        DEFAULT_ACPX_AGENT: "DEFAULT_WORKER_AGENT",
         ALLOWED_ACPX_AGENTS: "ALLOWED_WORKER_AGENTS",
       },
     });

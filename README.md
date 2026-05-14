@@ -260,7 +260,6 @@ Workflow:
 
 | 旧变量 | 新变量 |
 |---|---|
-| `DEFAULT_ACPX_AGENT` | `DEFAULT_WORKER_AGENT` |
 | `ALLOWED_ACPX_AGENTS` | `ALLOWED_WORKER_AGENTS` |
 
 ## 安全注意事项
