@@ -356,7 +356,7 @@ npm test
 本仓库已包含官方 MCP Registry 需要的 `server.json`，并在 `package.json` 中设置了匹配的 `mcpName`：
 
 ```text
-io.github.rvaim/agent
+io.github.rvaim/agent-worker-mcp
 ```
 
 Registry 名称是这个 MCP server 的稳定身份；npm 包名是其中一种分发方式。本项目的 npm 包名是 `@rvaim/agent-worker-mcp`。

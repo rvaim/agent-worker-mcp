@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.rvaim/agent",
+  "name": "io.github.rvaim/agent-worker-mcp",
   "title": "Agent Worker MCP",
   "description": "Generic MCP server for delegating tasks from one agent to another ACP-compatible worker agent through acpx.",
   "version": "0.2.0",

@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "description": "Generic MCP server for delegating tasks from one agent to another ACP-compatible worker agent through acpx.",
   "type": "module",
-  "mcpName": "io.github.rvaim/agent",
+  "mcpName": "io.github.rvaim/agent-worker-mcp",
   "repository": {
     "type": "git",
     "url": "https://github.com/rvaim/agent-worker-mcp.git"
