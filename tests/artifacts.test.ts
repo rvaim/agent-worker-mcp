@@ -5,12 +5,14 @@ import {
   artifactLabelForRun,
   buildInjectedContextMarkdown,
   buildRunningWorkerResult,
+  compactWorkerResult,
   cancelActiveBackgroundWorkers,
   extractRecentLines,
   launchBackgroundWorker,
   resolveWorktreePathFromResult,
   selectWorkerResultArtifactPaths,
   summarizeAcpxHelp,
+  summarizeInjectedContextFiles,
   summarizeWorkerStatus,
 } from "../src/index.js";
 
@@ -120,15 +122,132 @@ describe("buildInjectedContextMarkdown", () => {
     ]);
 
     expect(markdown).toContain("## Required Skills");
-    expect(markdown).toContain('<skill path="/Users/example/.codex/skills/review/SKILL.md" truncated="false" original_bytes="21" included_bytes="21">');
+    expect(markdown).toContain('<skill path="/Users/example/.codex/skills/review/SKILL.md" mode="inline" truncated="false" original_bytes="21" included_bytes="21">');
     expect(markdown).toContain("Use review checklist.");
     expect(markdown).toContain("## Context Files");
-    expect(markdown).toContain('<context_file path="/repo/docs/notes.md" truncated="true" original_bytes="120000" included_bytes="80000">');
+    expect(markdown).toContain('<context_file path="/repo/docs/notes.md" mode="inline" truncated="true" original_bytes="120000" included_bytes="80000">');
     expect(markdown).toContain("Project notes.");
   });
 
   it("returns an empty string when no files are injected", () => {
     expect(buildInjectedContextMarkdown([])).toBe("");
+  });
+
+  it("renders referenced context files without embedding file content", () => {
+    const markdown = buildInjectedContextMarkdown([
+      {
+        kind: "context",
+        path: "/repo/docs/large.md",
+        content: "SHOULD_NOT_BE_INCLUDED",
+        truncated: false,
+        original_bytes: 120000,
+        included_bytes: 0,
+        mode: "reference",
+      },
+    ]);
+
+    expect(markdown).toContain('<context_file path="/repo/docs/large.md" mode="reference"');
+    expect(markdown).toContain("Read this file from disk when needed.");
+    expect(markdown).not.toContain("SHOULD_NOT_BE_INCLUDED");
+  });
+});
+
+describe("compactWorkerResult", () => {
+  it("omits verbose fields and keeps review handles", () => {
+    const compact = compactWorkerResult({
+      task_id: "task-compact",
+      worker_agent: "claude",
+      status: "completed",
+      run_cwd: "/repo",
+      worktree_path: "/repo/.agent/worktrees/task-compact",
+      result_path: ".agent/results/task-compact.result.json",
+      events_path: ".agent/results/task-compact.run.events.ndjson",
+      diff_path: ".agent/results/task-compact.diff",
+      test_log_path: ".agent/results/task-compact.run.test.log",
+      changed_files: ["src/foo.ts"],
+      policy: { forbidden_file_modified: false, outside_allowed_files: false, violations: [] },
+      injected_context_files: [
+        {
+          kind: "context",
+          path: "/repo/docs/large.md",
+          content: "large content",
+          truncated: false,
+          original_bytes: 10000,
+          included_bytes: 10000,
+        },
+      ],
+      worker_summary: "Done",
+      acpx: { stdout_tail: "very long stdout" },
+      test: { stdout_tail: "very long test output" },
+    });
+
+    expect(compact).toEqual({
+      task_id: "task-compact",
+      worker_agent: "claude",
+      status: "completed",
+      run_cwd: "/repo",
+      worktree_path: "/repo/.agent/worktrees/task-compact",
+      artifacts: {
+        result_path: ".agent/results/task-compact.result.json",
+        events_path: ".agent/results/task-compact.run.events.ndjson",
+        revision_events_paths: [],
+        diff_path: ".agent/results/task-compact.diff",
+        cached_diff_path: null,
+        status_path: null,
+        test_log_path: ".agent/results/task-compact.run.test.log",
+        latest_test_log_path: null,
+      },
+      changed_files: ["src/foo.ts"],
+      policy: { forbidden_file_modified: false, outside_allowed_files: false, violations: [] },
+      worker_summary: "Done",
+      worker_stop_reason: null,
+      worker_error_event: null,
+      worker_tool_calls: [],
+      worker_input_tokens: null,
+      worker_output_tokens: null,
+      worker_cost_usd: null,
+      test_exit_code: null,
+      error: null,
+      background: null,
+      context_files: [
+        {
+          kind: "context",
+          path: "/repo/docs/large.md",
+          mode: "inline",
+          truncated: false,
+          original_bytes: 10000,
+          included_bytes: 10000,
+        },
+      ],
+      next_actions: [
+        "Use read_worker_result with view='review' to inspect diff and test logs before accepting.",
+        "Use apply_worker_patch after review if this task used an isolated worktree.",
+      ],
+    });
+  });
+});
+
+describe("summarizeInjectedContextFiles", () => {
+  it("strips content from injected context metadata", () => {
+    expect(summarizeInjectedContextFiles([
+      {
+        kind: "skill",
+        path: "/skill.md",
+        content: "secret instructions",
+        truncated: true,
+        original_bytes: 10,
+        included_bytes: 5,
+      },
+    ])).toEqual([
+      {
+        kind: "skill",
+        path: "/skill.md",
+        mode: "inline",
+        truncated: true,
+        original_bytes: 10,
+        included_bytes: 5,
+      },
+    ]);
   });
 });
 

@@ -125,6 +125,8 @@ ACPX_APPROVAL = "all"
   "forbidden_files": [".env", "migrations/**"],
   "skill_paths": ["/Users/me/.codex/skills/review/SKILL.md"],
   "context_files": ["docs/architecture.md"],
+  "context_mode": "reference",
+  "response_mode": "summary",
   "approval": "all",
   "mode": "exec",
   "test_command": {
@@ -134,13 +136,14 @@ ACPX_APPROVAL = "all"
 }
 ```
 
-`skill_paths` 和 `context_files` 会在 worker 运行前被复制进生成的 task prompt：
+`skill_paths` 和 `context_files` 会在 worker 运行前写入生成的 task prompt：
 
 - `skill_paths` 用于外部 skill 文件，例如 Codex 的 `SKILL.md`，支持仓库外绝对路径。
-- `context_files` 用于目标仓库内的上下文文件，路径必须保持在 `cwd` 内。
-- 每个注入文件默认最多注入 `80000` bytes，可通过 `WORKER_MAX_CONTEXT_FILE_BYTES` 调整。
+- `context_files` 用于目标仓库内的上下文文件，路径必须保持在 `cwd` 内。默认 `context_mode="reference"`，prompt 只包含文件路径和元数据，由 worker 按需读取文件，避免把大文件内容同时塞进主 agent 和 worker prompt。
+- 如果确实需要把 `context_files` 全文复制进 prompt，可显式设置 `context_mode="inline"`。每个 inline 文件默认最多注入 `80000` bytes，可通过 `WORKER_MAX_CONTEXT_FILE_BYTES` 调整。
+- `response_mode` 默认是 `summary`，`run_worker` / `revise_worker` 只返回任务状态、产物路径、变更摘要和下一步建议；需要调试完整 result JSON 时再显式设置 `response_mode="full"`。
 
-worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 result JSON、diff、测试日志和 policy，而不是只看 worker 的自然语言总结。
+worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 diff、测试日志和 policy，而不是只看 worker 的自然语言总结。默认 `read_worker_result` 使用 `view="summary"`，只返回紧凑摘要；审查时使用 `view="review"`，只有排查 MCP 产物本身时才用 `view="full"`。
 
 ## 后台任务和实时状态
 
@@ -156,7 +159,7 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 re
 }
 ```
 
-返回结果会是 `running` 或 `revising`，并包含 events/stderr 产物路径。
+返回结果默认是紧凑摘要，状态会是 `running` 或 `revising`，并包含 events/stderr 产物路径。它不会返回注入文件全文、diff 或测试日志。
 
 轮询当前状态：
 
@@ -164,7 +167,7 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 re
 {
   "task_id": "task-001",
   "cwd": "/path/to/repo",
-  "recent_lines": 20
+  "recent_lines": 5
 }
 ```
 
@@ -173,8 +176,8 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 re
 - 当前状态
 - 是否仍 active
 - 已运行时间
-- 最近 events
-- 最近 stderr
+- 最近少量 events
+- 最近少量 stderr
 - worker tool calls
 - worker summary / stop reason / error
 
@@ -191,7 +194,7 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 re
 
 使用 `watch_worker` 可以展示更完整的最近 events/stderr。它不是流式订阅，而是轮询友好的 watch helper。
 
-当 MCP server 进程结束、收到 `SIGINT` / `SIGTERM`，或 stdio 输入关闭时，server 会取消本次进程启动的后台 worker。取消会通过 `SIGTERM` 发送给对应的 `acpx` 子进程，5 秒后仍未退出则升级为 `SIGKILL`；result JSON 会更新为 `cancelled` 并记录取消原因。这个清理只作用于当前 MCP server 进程亲自启动的后台任务，不会按进程名误杀用户在其他终端或其他会话中启动的 Claude。
+当 MCP server 进程结束、收到 `SIGINT` / `SIGTERM`，或 stdio 输入关闭时，server 会取消本次进程启动的后台 worker。取消会通过 `SIGTERM` 发送给对应的 `acpx` 进程组，覆盖 `acpx` 拉起的 worker 子进程；5 秒后仍未退出则升级为 `SIGKILL`。server 会等待后台任务收敛后再退出，result JSON 会更新为 `cancelled` 并记录取消原因。这个清理只作用于当前 MCP server 进程亲自启动的后台任务，不会按进程名误杀用户在其他终端或其他会话中启动的 Claude。
 
 ## 示例：revise_worker
 
@@ -253,8 +256,8 @@ Workflow:
 | `ALLOWED_WORKER_AGENTS` | `*` | 逗号分隔的 worker allowlist，例如 `claude,gemini,opencode`。 |
 | `ACPX_APPROVAL` | `all` | 默认权限模式：`all`、`reads` 或 `deny`。 |
 | `WORKER_MAX_TIMEOUT_SECONDS` | `3600` | worker 任务默认最大运行秒数。 |
-| `WORKER_MAX_OUTPUT_BYTES` | `200000` | `read_worker_result` 默认返回产物的最大字节数。 |
-| `WORKER_MAX_CONTEXT_FILE_BYTES` | `80000` | 每个 `skill_paths` 或 `context_files` 注入文件的最大字节数。 |
+| `WORKER_MAX_OUTPUT_BYTES` | `200000` | `read_worker_result` 在 `view="review"` / `view="full"` 或显式 include 产物时的最大返回字节数。 |
+| `WORKER_MAX_CONTEXT_FILE_BYTES` | `80000` | 每个 inline `skill_paths` 或 `context_files` 注入文件的最大字节数。 |
 
 兼容旧变量名：
 
@@ -266,7 +269,7 @@ Workflow:
 
 - `ACPX_APPROVAL=all` 便于自动化，但会通过 `acpx` 给 worker 较宽的本地编辑和终端权限。建议配合 `isolate_worktree=true` 或一次性 checkout 使用。
 - `test_command` 的字符串形式会通过 shell 执行，只应传可信命令。更推荐 `{ "cmd": "...", "args": [...] }` 结构化形式。
-- `skill_paths` 和 `context_files` 会把文件内容注入 worker prompt。只传允许该 worker agent 读取的可信文件。
+- `skill_paths` 会把文件内容注入 worker prompt；`context_files` 默认只传路径引用，`context_mode="inline"` 时才注入内容。只传允许该 worker agent 读取的可信文件。
 - 使用 `ALLOWED_WORKER_AGENTS` 限制上游 agent 可调用的 worker。
 - 服务器会约束 `.agent` 产物路径并校验 `task_id`，但一旦 `acpx` 授权 worker，本 MCP 不能阻止 worker 编辑文件。
 - 接受 worker 输出前，必须审查 diff、测试日志和 policy violations。
@@ -313,8 +316,7 @@ acpx claude exec --help
 {
   "task_id": "task-001",
   "cwd": "/path/to/repo",
-  "include_diff": true,
-  "include_test_log": true
+  "view": "review"
 }
 ```
 
