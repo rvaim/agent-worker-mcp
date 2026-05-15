@@ -191,27 +191,33 @@ describe("summarizeWorkerStatus", () => {
 });
 
 describe("background worker cancellation", () => {
-  it("cancels tracked background workers on server shutdown", () => {
+  it("cancels tracked background workers on server shutdown", async () => {
     const controller = new AbortController();
     let cancelReason: string | undefined;
+    let resolveWorker: (() => void) | undefined;
+    const workerPromise = new Promise<void>((resolve) => {
+      resolveWorker = resolve;
+    });
 
     launchBackgroundWorker(
       "/repo",
       "task-bg-cancel",
       "/repo/.agent/results/task-bg-cancel.result.json",
-      new Promise(() => {}),
+      workerPromise,
       {
         abortController: controller,
         onCancel: (reason) => {
           cancelReason = reason;
+          resolveWorker?.();
         },
       },
     );
 
     const cancelled = cancelActiveBackgroundWorkers("test shutdown");
 
-    expect(cancelled).toBe(1);
+    expect(cancelled).toHaveLength(1);
     expect(controller.signal.aborted).toBe(true);
     expect(cancelReason).toBe("test shutdown");
+    await cancelled[0].promise;
   });
 });

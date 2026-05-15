@@ -3,7 +3,7 @@
   "name": "io.github.rvaim/agent-worker-mcp",
   "title": "Agent Worker MCP",
   "description": "Generic MCP server for delegating tasks from one agent to another ACP-compatible worker agent through acpx.",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "repository": {
     "url": "https://github.com/rvaim/agent-worker-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "npm",
       "identifier": "@rvaim/agent-worker-mcp",
-      "version": "0.2.1",
+      "version": "0.2.3",
       "transport": {
         "type": "stdio"
       }

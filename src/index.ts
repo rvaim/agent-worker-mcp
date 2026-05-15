@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
 const SERVER_NAME = "agent-worker-mcp";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.3";
 const DEFAULT_COMMON_WORKER_AGENTS = [
   "claude",
   "gemini",
@@ -173,6 +173,15 @@ type ActiveBackgroundJob = {
 
 const activeBackgroundJobs = new Map<string, ActiveBackgroundJob>();
 
+type ActiveCommand = {
+  command: string;
+  args: string[];
+  pid: number;
+  terminate: (reason: string) => void;
+};
+
+const activeCommands = new Map<number, ActiveCommand>();
+
 function textResult(value: unknown) {
   return {
     content: [
@@ -261,7 +270,43 @@ function relativeResultPath(from: string, to: string): string {
   return path.relative(from, to).split(path.sep).join("/");
 }
 
-async function runCommand(params: {
+function killWindowsProcessTree(pid: number) {
+  const args = ["/pid", String(pid), "/t", "/f"];
+  const killer = spawn("taskkill", args, {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  killer.on("error", () => {
+    // Process may already be gone, or taskkill may be unavailable.
+  });
+}
+
+function killPosixProcessGroup(pid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // Process group may already be gone.
+  }
+}
+
+function signalChild(child: ChildProcess, signal: NodeJS.Signals, killTree: boolean, useProcessGroup: boolean) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    if (killTree) {
+      killWindowsProcessTree(child.pid);
+    } else {
+      child.kill(signal);
+    }
+    return;
+  }
+  if (useProcessGroup) {
+    killPosixProcessGroup(child.pid, signal);
+    return;
+  }
+  child.kill(signal);
+}
+
+export async function runCommand(params: {
   command: string;
   args: string[];
   cwd: string;
@@ -271,6 +316,7 @@ async function runCommand(params: {
   env?: NodeJS.ProcessEnv;
   shell?: boolean;
   abort_signal?: AbortSignal;
+  kill_tree?: boolean;
 }): Promise<CommandResult> {
   if (params.stdout_path) await ensureDir(path.dirname(params.stdout_path));
   if (params.stderr_path) await ensureDir(path.dirname(params.stderr_path));
@@ -282,22 +328,36 @@ async function runCommand(params: {
   let cancelled = false;
   let cancel_reason: string | null = null;
   let killTimer: NodeJS.Timeout | undefined;
+  const killTree = params.kill_tree === true;
+  const useProcessGroup = killTree && process.platform !== "win32";
 
   const child = spawn(params.command, params.args, {
     cwd: params.cwd,
     env: params.env ?? process.env,
     shell: params.shell ?? false,
+    detached: useProcessGroup,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
 
   const terminateChild = (reason: string) => {
+    if (cancelled) return;
     cancelled = true;
     cancel_reason = reason;
     if (child.exitCode !== null || child.killed) return;
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    signalChild(child, "SIGTERM", killTree, useProcessGroup);
+    killTimer = setTimeout(() => signalChild(child, "SIGKILL", killTree, useProcessGroup), 5_000);
     killTimer.unref();
   };
+
+  if (child.pid) {
+    activeCommands.set(child.pid, {
+      command: params.command,
+      args: params.args,
+      pid: child.pid,
+      terminate: terminateChild,
+    });
+  }
 
   const onAbort = () => {
     terminateChild(String(params.abort_signal?.reason ?? "cancelled"));
@@ -336,6 +396,7 @@ async function runCommand(params: {
 
   if (timer) clearTimeout(timer);
   if (killTimer) clearTimeout(killTimer);
+  if (child.pid) activeCommands.delete(child.pid);
   params.abort_signal?.removeEventListener("abort", onAbort);
   await Promise.all([
     stdoutStream ? new Promise<void>((resolve) => stdoutStream.end(resolve)) : Promise.resolve(),
@@ -1082,6 +1143,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       stderr_path,
       timeout_ms: options.timeout_ms,
       abort_signal: options.abort_signal,
+      kill_tree: true,
     });
   } catch (err: any) {
     // Write failure result even when spawn crashes
@@ -1165,6 +1227,7 @@ async function runWorkerInternal(options: WorkerRunOptions) {
       timeout_ms: options.timeout_ms,
       shell: testCmd.shell,
       abort_signal: options.abort_signal,
+      kill_tree: true,
     });
   }
 
@@ -1320,7 +1383,7 @@ export function launchBackgroundWorker(
   } = {},
 ) {
   const started_at = new Date().toISOString();
-  const key = `${root}:${task_id}`;
+  const key = activeBackgroundJobKey(root, task_id);
   const promise = workerPromise
     .catch((err) => writeBackgroundFailureResult(root, task_id, resultPath, err))
     .finally(() => {
@@ -1331,17 +1394,36 @@ export function launchBackgroundWorker(
     if (!options.abortController?.signal.aborted) {
       options.abortController?.abort(reason);
     }
-    activeBackgroundJobs.delete(key);
   };
   activeBackgroundJobs.set(key, { started_at, task_id, promise, cancel });
 }
 
-export function cancelActiveBackgroundWorkers(reason = "MCP server shutdown cancelled background worker"): number {
+function activeBackgroundJobKey(root: string, task_id: string) {
+  return `${root}:${task_id}`;
+}
+
+export function cancelActiveBackgroundWorker(root: string, task_id: string, reason: string): ActiveBackgroundJob | undefined {
+  const job = activeBackgroundJobs.get(activeBackgroundJobKey(root, task_id));
+  job?.cancel(reason);
+  return job;
+}
+
+export function cancelActiveBackgroundWorkers(
+  reason = "MCP server shutdown cancelled background worker",
+): ActiveBackgroundJob[] {
   const jobs = [...activeBackgroundJobs.values()];
   for (const job of jobs) {
     job.cancel(reason);
   }
-  return jobs.length;
+  return jobs;
+}
+
+export function terminateActiveCommands(reason = "MCP server shutdown terminated active command"): number {
+  const commands = [...activeCommands.values()];
+  for (const command of commands) {
+    command.terminate(reason);
+  }
+  return commands.length;
 }
 
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
@@ -1854,9 +1936,47 @@ server.tool(
     const workerCwd = input.worker_cwd ? await resolveInside(root, input.worker_cwd) : root;
     const resultDir = path.join(root, ".agent", "results");
     await ensureDir(resultDir);
+    const existing = input.task_id ? await loadExistingResult(root, input.task_id) : null;
+
+    if (input.task_id) {
+      const activeJob = cancelActiveBackgroundWorker(root, input.task_id, "cancel_worker requested");
+      if (activeJob) {
+        const cancelResult = {
+          task_id: input.task_id,
+          worker_agent: input.worker_agent,
+          status: "cancel_requested",
+          cancel: {
+            attempted: true,
+            succeeded: true,
+            method: "local_abort",
+            active: true,
+            exit_code: null,
+            signal: null,
+            timed_out: false,
+            duration_ms: 0,
+            error: null,
+            note: "cancel_worker triggered this MCP server's active AbortController; process cleanup is handled by runCommand kill_tree.",
+          },
+        };
+
+        if (existing) {
+          existing.status = "cancel_requested";
+          existing.updated_at = new Date().toISOString();
+          existing.cancel = cancelResult.cancel;
+          await writeFile(
+            path.join(root, ".agent", "results", `${input.task_id}.result.json`),
+            JSON.stringify(existing, null, 2),
+          );
+        }
+
+        return textResult(cancelResult);
+      }
+    }
+
     const { command, args_prefix } = getAcpxCommand();
     const args = [...args_prefix, "--cwd", workerCwd, input.worker_agent];
-    if (input.session) args.push("-s", input.session);
+    const session = input.session ?? existing?.session;
+    if (session) args.push("-s", session);
     args.push("cancel");
 
     const result = await runCommand({
@@ -1866,6 +1986,7 @@ server.tool(
       stdout_path: path.join(resultDir, `cancel.${input.worker_agent}.stdout.log`),
       stderr_path: path.join(resultDir, `cancel.${input.worker_agent}.stderr.log`),
       timeout_ms: input.timeout_ms,
+      kill_tree: true,
     });
 
     const cancelAttempted = true;
@@ -1887,7 +2008,6 @@ server.tool(
     };
 
     if (input.task_id) {
-      const existing = await loadExistingResult(root, input.task_id);
       if (existing) {
         existing.status = cancelSucceeded ? "cancel_requested" : "cancel_failed";
         existing.updated_at = new Date().toISOString();
@@ -2276,34 +2396,58 @@ server.tool(
 );
 
 let shutdownHandlersInstalled = false;
+let shuttingDown = false;
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForShutdownSettlement(jobs: ActiveBackgroundJob[], waitForCommands: boolean) {
+  const jobsSettled = Promise.allSettled(jobs.map((job) => job.promise));
+  const settled = (async () => {
+    await jobsSettled;
+    while (waitForCommands && activeCommands.size > 0) {
+      await delayMs(50);
+    }
+  })();
+  await Promise.race([settled, delayMs(6_000)]);
+}
 
 function installBackgroundWorkerShutdownHandlers() {
   if (shutdownHandlersInstalled) return;
   shutdownHandlersInstalled = true;
 
-  const cancelFor = (reason: string) => {
-    const count = cancelActiveBackgroundWorkers(reason);
-    if (count > 0) {
-      console.error(`[${SERVER_NAME}] cancelled ${count} background worker(s): ${reason}`);
+  const shutdown = async (reason: string, exitCode?: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    const jobs = cancelActiveBackgroundWorkers(reason);
+    const commandCount = terminateActiveCommands(reason);
+    if (jobs.length > 0 || commandCount > 0) {
+      console.error(
+        `[${SERVER_NAME}] cancelled ${jobs.length} background worker(s), terminated ${commandCount} active command(s): ${reason}`,
+      );
     }
+
+    await waitForShutdownSettlement(jobs, commandCount > 0);
+
+    if (exitCode != null) process.exit(exitCode);
   };
 
   process.once("SIGINT", () => {
-    cancelFor("MCP server received SIGINT");
-    process.exit(130);
+    void shutdown("MCP server received SIGINT", 130);
   });
   process.once("SIGTERM", () => {
-    cancelFor("MCP server received SIGTERM");
-    process.exit(143);
+    void shutdown("MCP server received SIGTERM", 143);
   });
   process.once("beforeExit", () => {
-    cancelFor("MCP server beforeExit");
+    void shutdown("MCP server beforeExit");
   });
   process.stdin.once("end", () => {
-    cancelFor("MCP server stdin ended");
+    void shutdown("MCP server stdin ended");
   });
   process.stdin.once("close", () => {
-    cancelFor("MCP server stdin closed");
+    void shutdown("MCP server stdin closed");
   });
 }
 
