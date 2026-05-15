@@ -139,7 +139,7 @@ ACPX_APPROVAL = "all"
 `skill_paths` 和 `context_files` 会在 worker 运行前写入生成的 task prompt：
 
 - `skill_paths` 用于外部 skill 文件，例如 Codex 的 `SKILL.md`，支持仓库外绝对路径。
-- `context_files` 用于目标仓库内的上下文文件，路径必须保持在 `cwd` 内。默认 `context_mode="reference"`，prompt 只包含文件路径和元数据，由 worker 按需读取文件，避免把大文件内容同时塞进主 agent 和 worker prompt。
+- `context_files` 用于目标仓库内的上下文文件，路径必须保持在 `cwd` 内。推荐传路径数组；为兼容部分 host 暴露成单字符串的工具 schema，也接受单个路径字符串。默认 `context_mode="reference"`，prompt 只包含文件路径和元数据，由 worker 按需读取文件，避免把大文件内容同时塞进主 agent 和 worker prompt。
 - 如果确实需要把 `context_files` 全文复制进 prompt，可显式设置 `context_mode="inline"`。每个 inline 文件默认最多注入 `80000` bytes，可通过 `WORKER_MAX_CONTEXT_FILE_BYTES` 调整。
 - `response_mode` 默认是 `summary`，`run_worker` / `revise_worker` 只返回任务状态、产物路径、变更摘要和下一步建议；需要调试完整 result JSON 时再显式设置 `response_mode="full"`。
 
@@ -211,7 +211,7 @@ worker 完成后，上游 agent 应调用 `read_worker_result`，亲自检查 di
 }
 ```
 
-`revise_worker` 默认继承原任务的 `allowed_files`、`forbidden_files`、`skill_paths`、`context_files` 和 `test_command`。如果某次 revision 需要不同上下文，可显式传新数组覆盖。
+`revise_worker` 默认继承原任务的 `allowed_files`、`forbidden_files`、`skill_paths`、`context_files` 和 `test_command`。如果某次 revision 需要不同上下文，推荐显式传新数组覆盖；单个 `context_files` 字符串也会被兼容为单元素数组。
 
 ## 推荐 Leader / Reviewer 流程
 

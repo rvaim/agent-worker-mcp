@@ -9,6 +9,7 @@ import {
   cancelActiveBackgroundWorkers,
   extractRecentLines,
   launchBackgroundWorker,
+  normalizeContextPathListInput,
   resolveWorktreePathFromResult,
   selectWorkerResultArtifactPaths,
   summarizeAcpxHelp,
@@ -248,6 +249,16 @@ describe("summarizeInjectedContextFiles", () => {
         included_bytes: 5,
       },
     ]);
+  });
+});
+
+describe("normalizeContextPathListInput", () => {
+  it("wraps a single context file path for schema compatibility", () => {
+    expect(normalizeContextPathListInput("docs/architecture.md")).toEqual(["docs/architecture.md"]);
+  });
+
+  it("preserves context file arrays", () => {
+    expect(normalizeContextPathListInput(["docs/a.md", "docs/b.md"])).toEqual(["docs/a.md", "docs/b.md"]);
   });
 });
 

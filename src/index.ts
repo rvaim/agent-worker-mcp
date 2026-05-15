@@ -8,7 +8,7 @@ import path from "node:path";
 import { z } from "zod";
 
 const SERVER_NAME = "agent-worker-mcp";
-const SERVER_VERSION = "0.2.3";
+const SERVER_VERSION = "0.2.5";
 const DEFAULT_COMMON_WORKER_AGENTS = [
   "claude",
   "gemini",
@@ -167,6 +167,11 @@ function defaultMaxOutputBytes(): number {
 function defaultMaxContextFileBytes(): number {
   const bytes = Number.parseInt(process.env.WORKER_MAX_CONTEXT_FILE_BYTES ?? "80000", 10);
   return Number.isFinite(bytes) && bytes > 0 ? bytes : 80_000;
+}
+
+export function normalizeContextPathListInput(value: unknown): unknown {
+  if (typeof value === "string") return [value];
+  return value;
 }
 
 const envApproval = ["all", "reads", "deny"].includes(process.env.ACPX_APPROVAL ?? "")
@@ -1544,7 +1549,9 @@ const StructuredTestCommandSchema = z.union([
   z.string().min(1),
   z.object({ cmd: z.string().min(1), args: z.array(z.string()) }),
 ]);
-const ContextPathListSchema = z.array(z.string().min(1).max(4096)).max(20);
+const ContextPathSchema = z.string().min(1).max(4096);
+const ContextPathListSchema = z.array(ContextPathSchema).max(20);
+const ContextPathListInputSchema = z.preprocess(normalizeContextPathListInput, ContextPathListSchema);
 const ContextModeSchema = z.enum(["reference", "inline"]).default("reference");
 const ResponseModeSchema = z.enum(["summary", "full"]).default("summary");
 const ReadResultViewSchema = z.enum(["summary", "review", "full"]).default("summary");
@@ -1560,7 +1567,7 @@ server.tool(
     allowed_files: z.array(z.string()).optional(),
     forbidden_files: z.array(z.string()).optional(),
     skill_paths: ContextPathListSchema.optional().describe("Skill files to inject into the worker prompt. Absolute paths are supported, e.g. /Users/me/.codex/skills/foo/SKILL.md."),
-    context_files: ContextPathListSchema.optional().describe("Repository files to inject into the worker prompt. Paths must stay inside cwd."),
+    context_files: ContextPathListInputSchema.optional().describe("Repository files to inject into the worker prompt. Accepts one path string or an array of path strings; paths must stay inside cwd."),
     context_mode: ContextModeSchema.describe("How to provide context_files to the worker. reference writes file paths only; inline embeds file content in the prompt."),
     response_mode: ResponseModeSchema.describe("summary returns token-light handles and metadata. full returns the full result JSON."),
     worker_cwd: z.string().optional().describe("Directory for acpx --cwd, relative to cwd. Defaults to cwd."),
@@ -1705,7 +1712,7 @@ server.tool(
     allowed_files: z.array(z.string()).optional().describe("Override allowed files. Defaults to original task's allowed_files."),
     forbidden_files: z.array(z.string()).optional().describe("Override forbidden files. Defaults to original task's forbidden_files."),
     skill_paths: ContextPathListSchema.optional().describe("Override or provide skill files to inject into the revision prompt. Defaults to original task's skill_paths."),
-    context_files: ContextPathListSchema.optional().describe("Override or provide repository files to inject into the revision prompt. Defaults to original task's context_files."),
+    context_files: ContextPathListInputSchema.optional().describe("Override or provide repository files to inject into the revision prompt. Accepts one path string or an array of path strings. Defaults to original task's context_files."),
     context_mode: ContextModeSchema.describe("How to provide context_files to the worker. Defaults to the original task context_mode or reference."),
     response_mode: ResponseModeSchema.describe("summary returns token-light handles and metadata. full returns the full result JSON."),
     worker_cwd: z.string().optional(),
